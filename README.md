@@ -506,4 +506,4 @@ stdout_logfile=/path/to/logs/queue.log
 
 ---
 
-*本项目基于芸众商城（abangmishop）二次开发。详细架构与部署信息请参阅 `docs/` 目录。*
+

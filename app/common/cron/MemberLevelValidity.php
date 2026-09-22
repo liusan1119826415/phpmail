@@ -1,0 +1,77 @@
+<?php
+
+namespace app\common\cron;
+
+use app\common\events\member\MemberLevelExpireEvent;
+use app\common\facades\Setting;
+use app\common\models\UniAccount;
+use app\frontend\models\MemberShopInfo;
+use Illuminate\Foundation\Bus\DispatchesJobs;
+use Illuminate\Support\Facades\DB;
+
+
+class MemberLevelValidity
+{
+    use DispatchesJobs;
+
+    public $memberSet;
+    public $setLog;
+
+    public $uniacid;
+
+
+    public function handle()
+    {
+        \Log::info('会员等级到期');
+        set_time_limit(0);
+        $uniAccount = UniAccount::getEnable();
+        foreach ($uniAccount as $u) {
+            \YunShop::app()->uniacid = $u->uniacid;
+            Setting::$uniqueAccountId = $u->uniacid;
+            $this->uniacid = $u->uniacid;
+
+            $this->memberSet = Setting::get('shop.member');
+            $this->setLog = Setting::get('plugin.member_log');
+            if (!$this->memberSet['term'] || $this->memberSet['level_type'] != 2) {
+                continue;
+            }
+            $this->setReduceLevelValidity();
+
+            $this->setExpire();
+        }
+    }
+
+    public function setReduceLevelValidity()
+    {
+
+        if ($this->setLog['current_d'] == date('d')) {
+            return;
+        }
+
+        //设置当前执行日期
+        $this->setLog['current_d'] = date('d');
+        Setting::set('plugin.member_log', $this->setLog);
+
+        MemberShopInfo::uniacid()
+            ->where('validity', '>', '0')
+            ->update(['validity' => DB::raw('`validity` - 1')]);
+    }
+
+    public function setExpire()
+    {
+        $expireMember = MemberShopInfo::uniacid()
+            ->select('member_id')
+            ->where('level_id', '!=', '0')
+            ->where('validity', 0)
+            ->get()->pluck('member_id')->all();
+
+
+        if ($expireMember) {
+            \app\backend\modules\member\models\MemberShopInfo::uniacid()
+                ->whereIn('member_id', $expireMember)
+                ->update(['level_id' => 0, 'downgrade_at' => time()]);
+            event(new MemberLevelExpireEvent($expireMember));
+        }
+    }
+
+}

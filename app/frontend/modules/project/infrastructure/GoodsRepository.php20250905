@@ -1,0 +1,1047 @@
+<?php
+
+namespace app\frontend\modules\project\infrastructure;
+
+use app\common\exceptions\ShopException;
+
+use app\common\models\Address;
+use app\common\models\goods\GoodsOptionModel;
+use app\common\models\goods\GoodsStyleRelations;
+use app\common\models\GoodsCategory;
+use app\common\models\kefu\ServiceUser;
+use app\common\models\Order;
+use app\frontend\models\GoodsOption;
+use app\frontend\models\OrderGoods;
+use app\frontend\modules\coupon\models\Goods;
+use app\frontend\modules\goods\models\Comment;
+use app\frontend\modules\member\controllers\MemberFavoriteController;
+use app\frontend\modules\member\controllers\MemberHistoryController;
+use app\frontend\modules\project\models\Project;
+use app\frontend\modules\project\models\SearchGoods;
+use app\frontend\modules\project\repositories\GoodsRepositoryInterface;
+use app\frontend\modules\project\services\GoodsBaseService;
+use Illuminate\Support\Facades\DB;
+use Yunshop\Supplier\common\models\Supplier;
+use app\backend\modules\goods\models\Category;
+use app\common\models\goods\GoodsStyle;
+use Illuminate\Database\Eloquent\Builder;
+use Overtrue\Pinyin\Pinyin;
+use Illuminate\Support\Facades\Http;
+use Yunshop\Supplier\common\models\SupplierFollow;
+
+class GoodsRepository extends BaseRepository implements GoodsRepositoryInterface
+{
+
+
+    public function conditions(): array
+    {
+        ##获取品牌数据
+        $brand = Supplier::select("id", "store_name", "logo")->where('role_id',1)->where('status', 1)->where('enable',1)->get()->toArray();
+        if ($brand) {
+            $pinyin = new Pinyin(); // 使用 Overtrue Pinyin 库
+            foreach ($brand as $k => $item) {
+                $brand[$k]['logo'] = yz_tomedia($item['logo']);
+
+                // 获取 store_name 的第一个中文字
+                $firstChar = mb_substr($item['store_name'], 0, 1);
+
+                // 获取第一个字的拼音首字母（转大写）
+                $brand[$k]['first_letter'] = strtoupper($pinyin->abbr($firstChar));
+            }
+        }
+
+        $data['brand'] = $brand;
+        ##获取产品分类数据
+        $category = Category::getAllCategoryGroupArray();
+        $data['category'] = $category;
+        ##工艺材质数据
+        $craft_materials = GoodsStyle::select("id", "name")->where("type", 2)->get()->toArray();
+        $data['craft_materials'] = $craft_materials;
+        ##商品风格数据
+        $goods_style = GoodsStyle::select("id", "name")->where("type", 1)->get()->toArray();
+        $data['goods_style'] = $goods_style;
+        ##产地数据
+        $cityIds = Supplier::where('status', 1)->pluck("province_id")->all();
+        $data['city_list'] = Address::select("id", "areaname")->whereIn("id", $cityIds)->get()->toArray();
+        return $data;
+    }
+
+
+    public function conditionsV2(array $filters = []): array
+    {
+        $data = [];
+
+        // 获取基础查询（与search方法中的查询一致）
+        $baseQuery = SearchGoods::where('status', 1)
+            ->where('type2', 1)
+            ->whereHas('beLongsToSupplier', function($query) {
+                $query->where('status', 1)->where('enable', 1);
+            });
+
+        // 应用相同的过滤条件（确保条件一致）
+        if (!empty($filters)) {
+            $baseQuery = $this->applyFilters($baseQuery, $filters);
+        }
+        $goodsIds = $baseQuery->pluck('id')->toArray();
+        ## 获取品牌数据（只包含搜索结果中的品牌）
+        $brandIds = $baseQuery->pluck('supp_id')->unique()->toArray();
+
+       /* $brand = Supplier::select("id", "store_name", "logo")
+//            ->whereIn('id', $brandIds)
+            ->where('role_id', 1)
+            ->where('status', 1)
+            ->where('enable',1)
+            ->get()
+            ->toArray();
+
+        if ($brand) {
+            $pinyin = new Pinyin();
+            foreach ($brand as $k => $item) {
+                $brand[$k]['logo'] = yz_tomedia($item['logo']);
+                $firstChar = mb_substr($item['store_name'], 0, 1);
+                $brand[$k]['first_letter'] = strtoupper($pinyin->abbr($firstChar));
+            }
+        }
+        $data['brand'] = $brand;*/
+        $data['brandIds'] = $brandIds;
+        ## 获取产品分类数据（只包含搜索结果中的分类）
+        $categoryIds = GoodsCategory::whereIn('goods_id', $goodsIds)
+            ->pluck('category_ids')
+            ->flatMap(function ($ids) {
+                return explode(',', $ids);
+            })
+            ->unique()
+            ->values()
+            ->all();
+        //$data['category'] = Category::getHowCategoryGroupArray($categoryIds);
+        $data['categoryIds'] = $categoryIds;
+        ## 工艺材质数据（只包含搜索结果中的材质）
+        $data['craft_materials'] = GoodsStyle::whereHas('goodsStyleRelations', function($query) use ($goodsIds) {
+            $query->where("type", 2)
+                ->whereIn('goods_id', $goodsIds);
+        })
+            ->select("id", "name")
+            ->distinct()
+            ->get()
+            ->toArray();
+
+        ## 商品风格数据（只包含搜索结果中的风格）
+
+        $data['goods_style'] = GoodsStyle::whereHas('goodsStyleRelations', function($query) use ($goodsIds) {
+            $query->where("type", 1)
+                ->whereIn('goods_id', $goodsIds);
+        })
+            ->select("id", "name")
+            ->distinct()
+            ->get()
+            ->toArray();
+
+        ## 产地数据（只包含搜索结果中的产地）
+
+        $cityIds = Supplier::uniacid()->whereIn('id', $brandIds)
+            ->where('status', 1)
+
+            ->where('role_id', 1)
+            ->where('enable',1)
+            ->pluck("province_id")
+            ->unique()
+            ->toArray();
+
+        $data['cityIds'] = $cityIds;
+        /*$data['city_list'] = Address::select("id", "areaname")
+            ->whereIn("id", $cityIds)
+            ->get()
+            ->toArray();*/
+
+        return $data;
+    }
+
+    protected function isEmptyFilter(array $filters): bool
+    {
+        foreach ($filters as $key => $value) {
+            if (is_array($value) && !empty($value)) {
+                return false; // 数组不为空，说明有筛选条件
+            }
+
+            if (!is_array($value) && !is_null($value) && $value !== '') {
+                return false; // 字符串或数字不为空
+            }
+        }
+        return true; // 所有都为空，才返回 true
+    }
+
+    protected function markCategoryDisabled(array $categories, array $enabledIds): array
+    {
+        foreach ($categories as &$cat) {
+            // 当前分类是否可选
+            $cat['disabled'] = !in_array($cat['id'], $enabledIds);
+
+            // 如果有子分类，递归处理
+            if (!empty($cat['childrens'])) {
+                $cat['childrens'] = $this->markCategoryDisabled($cat['childrens'], $enabledIds);
+
+            }
+        }
+        return $categories;
+    }
+
+
+
+    public function conditionsCombined(array $filters = []): array
+    {
+        // 全量数据
+        $allData = $this->conditions();
+
+        // 如果没有 filters，直接返回全部高亮
+        if ($this->isEmptyFilter($filters)) {
+            // 所有字段设置 disabled 为 false
+            foreach (['brand', 'category', 'craft_materials', 'goods_style', 'city_list'] as $field) {
+                foreach ($allData[$field] as &$item) {
+
+                    $item['disabled'] = false;
+                }
+            }
+            return $allData;
+        }
+
+        // 有 filters 的时候再获取受限项
+        $filteredData = $this->conditionsV2($filters);
+
+        // 品牌
+      /*  $enabledBrandIds = $filteredData['brandIds'];
+        foreach ($allData['brand'] as &$brand) {
+            $brand['disabled'] = !in_array($brand['id'], $enabledBrandIds);
+        }*/
+
+        // 分类
+        $enabledCategoryIds = $filteredData['categoryIds'];
+        $allData['category'] = $this->markCategoryDisabled($allData['category'], $enabledCategoryIds);
+
+        // 材质
+        $enabledMaterialIds = collect($filteredData['craft_materials'])->pluck('id')->all();
+        foreach ($allData['craft_materials'] as &$mat) {
+            $mat['disabled'] = !in_array($mat['id'], $enabledMaterialIds);
+        }
+
+        // 风格
+        $enabledStyleIds = collect($filteredData['goods_style'])->pluck('id')->all();
+        foreach ($allData['goods_style'] as &$style) {
+            $style['disabled'] = !in_array($style['id'], $enabledStyleIds);
+        }
+
+        // 产地
+        $enabledCityIds = $filteredData['cityIds'];
+        foreach ($allData['city_list'] as &$city) {
+            $city['disabled'] = !in_array($city['id'], $enabledCityIds);
+        }
+
+        return $allData;
+    }
+
+
+    public function search(array $filters, array $order_field): array
+    {
+        // 设置排序字段映射
+        $fieldMapping = [
+            'all' => 'display_order',
+            'sale' => 'show_sales',
+            'comment_num' => 'comment_num',
+            'price'=>'price'
+        ];
+
+        $name = $fieldMapping[$order_field['name']] ?? 'display_order';
+        $order_by = $order_field['order_by'] == 1 ? "asc" : "desc";
+
+        // 构建主查询
+        $query = SearchGoods::select('id', 'title', 'thumb', 'price', 'supp_id', 'show_sales', 'comment_num','is_discount','is_hot','is_stock')
+            ->where('status', 1)
+            ->where('type2', 1)
+            ->with([
+                'beLongsToSupplier' => function ($query) use ($filters) {
+//                    if (!empty($filters['cityIds'])) {
+//                        $query->whereIn('city_id', $filters['cityIds']);
+//                    }
+                    $query->select('id', 'city_id', "store_name", "logo"); // 仅获取必要字段
+                }
+            ]);
+
+        // 应用过滤条件
+        $query = $this->applyFilters($query, $filters);
+        $query->whereHas('beLongsToSupplier', function ($query) use ($filters) {
+            $query->where('status', 1)->where('enable',1);
+        });
+        if($name == "display_order"){
+            $order_by = "asc";
+        }
+
+        // 分页查询
+        $list = $query->orderBy($name, $order_by)->paginate(20);
+
+        // 提取所有需要的 `city_id`
+        $cityIds = $list->pluck('beLongsToSupplier.city_id')->unique()->filter()->toArray();
+
+        // 一次性获取城市名称
+        $cityNames = Address::whereIn('id', $cityIds)->pluck('areaname', 'id');
+
+        // 构造最终结果
+        $list->transform(function ($item) use ($cityNames) {
+            $item->city_name = $cityNames[$item->beLongsToSupplier['city_id']] ?? '';
+            $item->logo = yz_tomedia($item->logo);
+            $item->thumb = yz_tomedia($item->thumb);
+            $item->price = $this->formatNumber($item->price);
+            return $item;
+        });
+
+
+        // 转换为数组返回
+        // 获取当前搜索结果的条件
+        $currentConditions = $this->conditionsCombined($filters);
+
+        // 转换为数组返回，并附加条件数据
+        $result = $list->toArray();
+        $result['conditions'] = $currentConditions;
+
+        return $result;
+    }
+
+
+
+
+
+
+
+
+
+
+    protected function applyFilters(Builder $query, array $filters): Builder
+    {
+        if (!empty($filters['brandIds'])) {
+            $query->whereIn('supp_id', $filters['brandIds']);
+        }
+
+        if (!empty($filters['start_price']) && !empty($filters['end_price'])) {
+            /*$query->whereHas('hasManyOptions', function ($query) use ($filters) {
+                $query->whereBetween('product_price', [$filters['start_price'], $filters['end_price']]);
+            });*/
+            $query->whereBetween("price", [$filters['start_price'], $filters['end_price']]);
+        }
+
+        if (!empty($filters['start_price']) && empty($filters['end_price'])) {
+            /*$query->whereHas('hasManyOptions', function ($query) use ($filters) {
+                $query->where('product_price', ">=", $filters['start_price']);
+            });*/
+            $query->where('price', ">=", $filters['start_price']);
+        }
+
+        if (empty($filters['start_price']) && !empty($filters['end_price'])) {
+            /*$query->whereHas('hasManyOptions', function ($query) use ($filters) {
+                $query->where('product_price', ">=", $filters['end_price']);
+            });*/
+            $query->where('price', ">=", $filters['end_price']);
+        }
+
+        if (!empty($filters['categoryIds'])) {
+            $query->whereHas('hasManyGoodsCategory', function ($query) use ($filters) {
+                $query->whereIn('category_id', $filters['categoryIds']);
+            });
+        }
+
+        if (!empty($filters['materialIds'])) {
+            $query->whereHas('hasManyCraftMaterials', function ($query) use ($filters) {
+                $query->whereIn('style_id', $filters['materialIds']);
+            });
+        }
+
+        if (!empty($filters['styleIds'])) {
+            $query->whereHas('hasManyGoodsStyle', function ($query) use ($filters) {
+                $query->whereIn('style_id', $filters['styleIds']);
+            });
+        }
+
+        if (!empty($filters['bid_enable'])) {
+            if($filters['bid_enable'] == 1){
+                $filters['bid_enable'] = 0;
+            }elseif($filters['bid_enable'] == 2){
+                $filters['bid_enable'] = 1;
+            }
+            $query->whereHas('beLongsToSupplier', function ($query) use ($filters) {
+
+                $query->where('bid_enable', $filters['bid_enable']);
+            });
+        }
+        if (!empty($filters['is_stock'])) {
+            $query->where('is_stock', $filters['is_stock']);
+        }
+
+        if (!empty($filters['cityIds'])) {
+            $query->whereHas('beLongsToSupplier', function ($query) use ($filters) {
+                $query->whereIn('province_id', $filters['cityIds']);
+            });
+        }
+
+        if (!empty($filters['start_size']) && empty($filters['end_size'])) {
+            $query->whereHas('hasManyOptions', function ($query) use ($filters) {
+                $query->where('length', $filters['start_size']);
+            });
+        }
+
+        if (empty($filters['start_size']) && !empty($filters['end_size'])) {
+            $query->whereHas('hasManyOptions', function ($query) use ($filters) {
+                $query->where('length', $filters['end_size']);
+            });
+        }
+
+        if (!empty($filters['start_size']) && !empty($filters['end_size'])) {
+            $query->whereHas('hasManyOptions', function ($query) use ($filters) {
+                $query->whereBetween('length', [$filters['start_size'], $filters['end_size']]);
+            });
+        }
+
+        if (!empty($filters['lead_time'])) {
+            $query->where('lead_time', $filters['lead_time']);
+        }
+
+        if (!empty($filters['title'])) {
+            $title = trim($filters['title']);
+            $terms = [];
+
+            // 按2个字符一组分词
+            $len = mb_strlen($title, 'UTF-8');
+            for ($i = 0; $i < $len - 1; $i++) {
+                $term = mb_substr($title, $i, 2, 'UTF-8');
+                if (!empty(trim($term))) {
+                    $terms[] = $term;
+                }
+            }
+
+            $query->where(function($q) use ($terms, $title) {
+                // 1. 完全匹配（最高优先级）
+                $q->orWhere('title', $title)
+                    ->orWhere('keywords', $title);
+
+                // 2. 开头匹配（次高优先级）
+                $q->orWhere('title', 'like', $title.'%')
+                    ->orWhere('keywords', 'like', $title.'%');
+
+                // 3. 包含完整标题
+                $q->orWhere('title', 'like', '%'.$title.'%')
+                    ->orWhere('keywords', 'like', '%'.$title.'%');
+
+                // 4. 分词匹配
+                if (!empty($terms)) {
+                    $q->orWhere(function($subQuery) use ($terms) {
+                        foreach ($terms as $term) {
+                            $subQuery->orWhere('title', 'like', '%'.$term.'%')
+                                ->orWhere('keywords', 'like', '%'.$term.'%');
+                        }
+                    });
+                }
+            });
+
+            // 优化后的排序逻辑（title + keywords 都算权重）
+            $orderByRaw = "
+        CASE 
+            WHEN title = ? OR keywords = ? THEN 1000  -- 完全匹配
+            WHEN title LIKE ? OR keywords LIKE ? THEN 800  -- 开头匹配
+            WHEN title LIKE ? OR keywords LIKE ? THEN 600  -- 包含完整标题
+            ELSE (
+                -- 计算匹配的分词数量
+                " . implode(" + ", array_map(function($term) {
+                    return "(IF(title LIKE '%".addslashes($term)."%', 1, 0) + IF(keywords LIKE '%".addslashes($term)."%', 1, 0))";
+                }, $terms)) . "
+            )
+        END DESC
+    ";
+
+            $query->orderByRaw($orderByRaw, [
+                $title, $title,
+                $title.'%', $title.'%',
+                '%'.$title.'%', '%'.$title.'%'
+            ]);
+        }
+
+
+        return $query;
+    }
+
+    public function previewList(int $project_id): array
+    {
+
+        $memberId = \YunShop::app()->getMemberId();
+        //检查是否有订单
+        $Project = Project::find($project_id);
+
+        $orderGoods = null;
+        if($Project->order_id){
+
+            $orderGoods = OrderGoods::select("goods_id", "goods_option_id","space_id", "price", "goods_option_price")
+                ->where('order_main_id', $Project->order_id)
+                ->get()
+                ->mapWithKeys(function ($item) {
+                    return [ $item->goods_id . '_' . $item->goods_option_id . '_'. $item->space_id => $item ];
+                });
+        }
+        $data = app('CartContainer')->make('MemberCart')->floor()
+            ->where(app('CartContainer')->make('MemberCart')->getTable() . '.member_id', $memberId)
+            ->where(app('CartContainer')->make('MemberCart')->getTable() . '.project_id', $project_id)
+            ->orderBy(app('CartContainer')->make('MemberCart')->getTable() .'.sort','asc')
+            ->orderBy(app('CartContainer')->make('MemberCart')->getTable() . '.created_at', 'desc')
+            ->get()->toArray();
+
+        $result = collect($data)->groupBy('belongs_to_floor.id')->map(function ($floorItems, $floorId) use($Project,$orderGoods) {
+            $floorName = $floorItems->first()['belongs_to_floor']['floor_name'];
+
+            // 按空间分组
+            $spaces = collect($floorItems)->groupBy('belongs_to_space.id')->map(function ($spaceItems, $spaceId) use($Project,$orderGoods) {
+                $spaceName = $spaceItems->first()['belongs_to_space']['space_name'];
+
+                $goodsData = $spaceItems->map(function ($item) use($Project,$orderGoods) {
+                    $key = $item['goods']['id'] . '_' . $item['goods_option']['id'] . '_' . $item['space_id'];
+                    $oldOptionData = [];
+                    if ($item['goods']['productType'] == 5 && !empty($item['goods']['old_option'])) {
+                        // 反序列化 old_option
+                        $old_option = unserialize($item['goods']['old_option']);
+
+                        if (is_array($old_option)) {
+                            // 查询 old_option 对应的 goods_option 尺寸信息
+                            $optionIds = collect($old_option)->pluck('option_id')->all();
+                            $options = GoodsOption::whereIn('id', $optionIds)
+                                ->get(['id', 'length', 'width', 'height', 'title','structure','product_price'])
+                                ->keyBy('id');
+
+                            // 组装 old_option 数据，包含数量和尺寸
+                            foreach ($old_option as $opt) {
+                                $optId = $opt['option_id'];
+                                $oldOptionData[] = [
+                                    'option_id' => $optId,
+                                    'num'       => $opt['num'],
+                                    'length'    => isset($options[$optId]) ? $options[$optId]->length : null,
+                                    'width'     => isset($options[$optId]) ? $options[$optId]->width : null,
+                                    'height'    => isset($options[$optId]) ? $options[$optId]->height : null,
+                                    'title'     => isset($options[$optId]) ? $options[$optId]->title : null,
+                                    'product_price' => isset($options[$optId]) ? $options[$optId]->product_price : 0,
+                                    'total_price' => isset($options[$optId]) ? $options[$optId]->product_price*$opt['num'] : 0,
+                                    'structure' =>isset($options[$optId]) ? $options[$optId]->structure : null,
+                                ];
+                            }
+                        }
+                    }
+                    return [
+                        'goods_id' => $item['goods']['id'],
+                        'option_id'=>$item['goods_option']['id'],
+                        'title' => $item['goods']['title'],
+                        "total" => $item['total'],
+                        'is_customized'=>$item['is_customized'],
+                        "thumb" => yz_tomedia($item['goods_option']['thumb']),
+                        "product_price" => $Project->order_id && isset($orderGoods[$key])
+                            ? $orderGoods[$key]->goods_option_price
+                            : $item['goods_option']['product_price'],
+                        "unit_price" => $item['goods_option']['market_price'],
+                        "total_price" => $Project->order_id && isset($orderGoods[$key])
+                            ? $orderGoods[$key]->price
+                            : $item['total'] * $item['goods_option']['product_price'],
+                        "total_unit_price" => $item['total'] * $item['goods_option']['market_price'],
+                        "status" => $this->getGoodsStatus($item),
+                        "sku" => $item['goods']['sku'],
+                        "type"=> $item['type'],
+                        "length" => $item['goods_option']['length'],
+                        "width" => $item['goods_option']['width'],
+                        "height" => $item['goods_option']['height'],
+                        "goods_option_title"=>$item['goods_option']['title'],
+                        "product_model" => $item['goods_option']['product_model'],
+                        "material_color" => $this->getMaterialColor($item),
+                        "service_link"=>ServiceUser::getDistributeService($item['goods']['supp_id'],$item['goods']['id']),
+                        "structure" => $item['goods_option']['structure'],
+                        "volume" => $item['goods_option']['volume'],
+                        "jsonData" => !empty($item['jsonData'])?json_decode($item['jsonData'],true):[],
+                        "modelData" => !empty($item['modelData'])?json_decode($item['modelData'],true):[],
+                        'option_children'=>$oldOptionData,
+                        'category_name'=>GoodsCategory::getGoodsFirstCatName($item['goods']['id'])
+
+                    ];
+                })->values();
+                $spaceTotalPrice = $goodsData->sum('total_price');
+
+                $spaceTotalNum = $goodsData->sum('total');
+                return [
+                    'space_id' => $spaceId,
+                    'space_name' => $spaceName,
+                    'goods' => $goodsData,
+                    'space_total_price' => $spaceTotalPrice,
+                    'space_total_num' => $spaceTotalNum,
+                ];
+            })->values();
+            $floorTotalPrice = $spaces->sum('space_total_price');
+
+            $floorTotalNum = $spaces->sum('space_total_num');
+            return [
+                'floor_id' => $floorId,
+                'floor_name' => $floorName,
+                'space' => $spaces,
+                'floor_total_price' => $floorTotalPrice,
+                'floor_total_num' => $floorTotalNum,
+
+            ];
+        })->values();
+        $projectTotalPrice = $result->sum('floor_total_price');
+        $projectTotalNum = $result->sum('floor_total_num');
+
+        return [
+            'project_total_price' => $projectTotalPrice,
+            'project_total_num' => $projectTotalNum,
+            'data' => $result->toArray()
+        ];
+    }
+
+    //批量修改单价
+
+    public function updateUnitPrice(array $option_ids, float $price, int $method, int $space_id): array
+    {
+        try {
+            if ($method === 2) {
+                $updatedRows = GoodsOption::whereIn('id', $option_ids)
+                    ->update(['market_price' => \DB::raw('product_price *' . $price)]);
+            } else {
+                // 否则更新为固定值
+                $updatedRows = GoodsOption::whereIn('id', $option_ids)
+                    ->update(['market_price' => $price]);
+            }
+
+            if ($updatedRows > 0) {
+                $space_goods_list = $this->updateCart($space_id);
+
+                $first = app('OrderManager')->make('MemberCart')->where('space_id', $space_id)->first();
+                $data = $this->updateActivateCache(\YunShop::app()->getMemberId(), $first->project_id);
+                return ['project_statistics' => $data, 'space_goods_list' => $space_goods_list];
+            }
+        } catch (\Exception $e) {
+            throw new ShopException($e->getMessage());
+        }
+
+
+    }
+
+
+    //替换
+    public function updateOption(array $request_data): array
+    {
+        try {
+
+            $cartModel = app('OrderManager')->make('MemberCart')->find($request_data['id']);
+            $space_id = $cartModel->space_id;
+            $data['option_id'] = $request_data['option_id'];
+            $data['member_id'] = \YunShop::app()->getMemberId();
+            $data['goods_id'] = $cartModel->goods_id;
+            $data['space_id'] = $cartModel->space_id;
+            $request_data['components'] = $request_data['components']?array_map(function($item) {
+                return json_decode($item, true); // true 表示返回关联数组
+            }, $request_data['components']):[];
+
+            $data['components_hash'] = md5(json_encode($request_data['components'], JSON_UNESCAPED_UNICODE));
+
+            $hasGoodsModel = app('OrderManager')->make('MemberCart')->hasGoodsToMemberCart($data);
+
+            if ($hasGoodsModel) {
+
+                $hasGoodsModel->components_hash = $data['components_hash'];
+                $hasGoodsModel->option_id = $request_data['option_id'];
+                $hasGoodsModel->components = json_encode($request_data['components'],JSON_UNESCAPED_UNICODE);
+                $hasGoodsModel->validate();
+                if ($hasGoodsModel->update()) {
+                    $cartModel->delete();
+                }
+            } else {
+                $cartModel->option_id = $request_data['option_id'];
+                $cartModel->components_hash = md5(json_encode($request_data['components'], JSON_UNESCAPED_UNICODE));
+                $cartModel->components = json_encode($request_data['components'], JSON_UNESCAPED_UNICODE);
+                $cartModel->save();
+            }
+
+            $data = $this->updateCart($space_id);
+            return ['space_goods_list' => $data];
+
+        } catch (\Exception $e) {
+            throw new ShopException($e->getMessage());
+        }
+
+    }
+
+    //解析cad图纸
+
+    public function analysis(): array
+    {
+        $dwgFile = request()->file('file');
+        $dwgFilePath = $dwgFile->storeAs('uploads', $dwgFile->getClientOriginalName());
+        $response = $this->curl_analysis_cad("search_block", $dwgFilePath);
+        if ($response['data']['status_code'] == 200) {
+            $dxf_file = $response['data']['dxf_file'];
+            $output_img = $response['data']['output_img'];
+
+            $img_url = "https://" . Request()->getHost() . "/ppt/img/{$output_img}";
+            $dxf_url = "https://" . Request()->getHost() . "/dxf/{$dxf_file}";
+            $data = $response['data']['data'];
+            $goods_total = collect($data)->sum('num');
+            $grouped = collect($data)
+                ->groupBy('space_name') // 以 space_name 分组
+                ->map(function ($items, $spaceName) {
+                    return [
+                        'space_name' => $spaceName,
+                        'data' => $items->map(function ($item) {
+                            return [
+                                'goods_id' => $item['goods_id'],
+                                'option_id' => $item['option_id'],
+                                'num' => $item['num']
+                            ];
+                        })->values()
+                    ];
+                })
+                ->values();
+
+            return [
+                "dxf_url" => $dxf_url,
+                "output_img"=>$img_url,
+                "goods_total" => $goods_total,
+                "data" => $grouped->toArray()
+            ];
+
+        } else {
+            throw new ShopException($response['data']['message']);
+        }
+    }
+
+
+    public function analysisV2(): array
+    {
+        // 接收多个 DWG 文件
+        $dwgFiles = request()->file('file'); // 确保前端传递字段名为 'files'
+
+        $uploadedFiles = [];
+        foreach ($dwgFiles as $dwgFile) {
+            // 保存文件到 uploads 目录
+            $dwgFilePath = $dwgFile->storeAs('uploads', $dwgFile->getClientOriginalName());
+            $uploadedFiles[] = $dwgFilePath;
+        }
+
+        // 调用 curl_analysis_cad 方法，传递多个文件路径
+        $response = $this->curl_analysis_cad_v2("search_block_v2", $uploadedFiles);
+
+        if ($response['data']['status_code'] == 200) {
+
+            $data = $response['data']['results'];
+            $collection = collect($data);
+            $totalNum = $collection->flatMap(function ($item) {
+                return $item['data'];
+            })->sum('num');
+            $dxfFiles = [];
+            $transformed = $collection->map(function ($item) {
+
+                $goods_total = collect($item['data'])->sum('num');
+                $groupedData = collect($item['data'])
+                    ->groupBy('space_name') // 按 space_name 分组
+                    ->map(function ($group, $spaceName) {
+                        return [
+                            "space_name" => $spaceName,
+                            "data" => $group->map(function ($entry) {
+                                return [
+                                    "goods_id" => $entry['goods_id'],
+                                    "option_id" => $entry['option_id'],
+                                    "num" => $entry['num'],
+                                ];
+                            })->values(),
+                        ];
+                    })->values();
+                $dxf_file = $item['dxf_file'];
+                $dxfFiles[] = $dxf_file;
+                $item['data'] = $groupedData;
+                $item['goods_total'] = $goods_total;
+
+                $dxf_url = "https://" . Request()->getHost() . "/dxf/{$dxf_file}";
+                $img_name = basename($item['output_img']);
+                $img_url = "https://" . Request()->getHost() . "/ppt/img/{$img_name}";
+                $item['dxf_file'] = $dxf_url;
+                $item['output_img'] = $img_url;
+                return $item;
+            });
+
+            return ['totalNum'=>$totalNum,'data'=>$transformed->toArray()];
+
+        } else {
+            throw new ShopException($response['data']['message']);
+        }
+    }
+
+
+    public function getGoodsOption(int $goods_id): array
+    {
+        $option_select = 'id,goods_id,title,thumb,product_price,cost_price,market_price,stock,specs,weight,product_sn';
+        $goods = Goods::select("id","title","structure")->with(['hasManySpecs'=>function ($query) {
+            return $query->select('id', 'goods_id', 'title', 'description')->with(['hasManySpecsItem' => function ($specs) {
+                return $specs->select('id', 'title', 'specid', 'thumb', 'parent_id', 'level')->where('show', 1)->orderBy('display_order', 'asc');
+            }])->orderBy('display_order', 'asc');
+        },'hasManyOptions' => function ($query) use ($option_select) {
+            return $query->selectRaw($option_select)->where('modelType',0);
+        }])->find($goods_id);
+        if(!$goods){
+            throw new ShopException("未找到该商品");
+        }
+
+        $goods->hasManySpecs->each(function ($specs) {
+            // 处理所有规格项
+            $items = $specs->hasManySpecsItem
+                ->map(function ($item) {
+                    return tap($item, function ($item) {
+                        $item->thumb = yz_tomedia($item->thumb);
+                        $item->children = collect();
+                    });
+                })
+                ->keyBy('id');
+
+            // 构建树形结构
+            $specs->tree = $items->filter(function ($item) use ($items) {
+                if ($item->parent_id > 0 && $parent = $items->get($item->parent_id)) {
+                    // 添加到父节点的children
+                    $parent->children->push($item);
+                    return false; // 过滤掉非根节点
+                }
+                return true; // 保留根节点 (parent_id == 0)
+            })->values(); // 重新索引数组
+            unset($specs->hasManySpecsItem);
+            return $specs;
+        });
+        $optionIds = $goods->hasManyOptions->pluck('id')->toArray();
+        $modelParams = GoodsOptionModel::whereIn('option_id', $optionIds)->get();
+
+        // 预处理，将数据按 option_id 分组，减少后续查询
+        $modelParamsGrouped = $modelParams->groupBy('option_id');
+        foreach ($goods->hasManyOptions as $item) {
+            $item->thumb = yz_tomedia($item->thumb);
+            // 赋值 model_param，只获取当前 option_id 对应的数据
+            $item->has_many_option_models = isset($modelParamsGrouped[$item->id]) ?
+                $modelParamsGrouped[$item->id]->map(function ($param) {
+                    $param->default_color = !empty($param->default_color) ? unserialize($param->default_color) : [];
+                    $param->select_color = !empty($param->select_color) ? unserialize($param->select_color) : [];
+                    $param->map_param = !empty($param->map_param) ? unserialize($param->map_param) : [];
+                    return $param;
+                }) : collect();
+        }
+
+
+        $goodsBaseService = new GoodsBaseService($goods->id);
+
+        $goods->three_model = $goodsBaseService->getThreeModel();
+
+
+        return $goods->toArray();
+
+    }
+
+    //获取商品详情数据
+
+    public function getGoodsInfo(int $id):array
+    {
+
+       $goodsBase = new GoodsBaseService($id);
+       $data = $goodsBase->getGoodsData();
+       return $data;
+    }
+
+
+    /*public function getComment()
+    {
+        $goods_id = request()->goods_id;
+        $filter = request()->filter;
+        $fieldMapping = [
+            'time' => 'created_at',
+            'score' => 'level',
+        ];
+        $sort = request()->sort;
+        $name = $fieldMapping[$sort] ?? 'created_at';
+
+        // 基础查询条件
+        $baseQuery = Comment::uniacid()
+            ->where('type', 1) // 主评论
+            ->where('goods_id', $goods_id)
+            ->where('is_show', 1);
+
+        // 统计数据
+        $stats = [
+            'all' => (clone $baseQuery)->count(),
+            'good' => (clone $baseQuery)->whereBetween('level', [4, 5])->count(),
+            'medium' => (clone $baseQuery)->where('level', 3)->count(),
+            'bad' => (clone $baseQuery)->whereBetween('level', [1, 2])->count(),
+        ];
+
+        // 主查询
+        $query = (clone $baseQuery)
+            ->with([
+                'orderGoods' => function($query) {
+                    $query->select("id", "components", "goods_option_title", "type");
+                },
+                // 一级回复（直接回复主评论）
+                'hasManyReply' => function($query) {
+                    $query->where('type', 2)
+                        ->where('is_show', 1)
+                        ->with([
+                            // 二级回复（回复的回复）
+                            'hasManyReply as nested_replies' => function($query) {
+                                $query->where('type', 2)
+                                    ->where('is_show', 1);
+                            }
+                        ]);
+                }
+            ]);
+
+        // 筛选条件
+        switch ($filter) {
+            case 'good': $query->whereBetween('level', [4, 5]); break;
+            case 'medium': $query->where('level', 3); break;
+            case 'bad': $query->whereBetween('level', [1, 2]); break;
+        }
+
+        $comment_data = $query->orderBy($name, 'desc')->paginate(10);
+
+        // 转换数据
+        $comment_data->transform(function ($item) {
+            $item->nick_name = substrCut2($item->nick_name);
+            $item->images = array_map(fn($url) => yz_tomedia($url), @unserialize($item->images) ?: []);
+
+            // 处理 orderGoods 数据
+            if ($item->orderGoods) {
+                $item->material_color = $this->getMaterialColor($item->orderGoods->toArray());
+            }
+
+            // 确保回复数据是集合
+            $item->hasManyReply = $item->hasManyReply ?? collect();
+
+            // 处理二级回复的昵称和图片
+            $item->hasManyReply->each(function ($reply) {
+                $reply->nick_name = substrCut2($reply->nick_name);
+                $reply->images = array_map(fn($url) => yz_tomedia($url), @unserialize($reply->images) ?: []);
+
+                // 处理嵌套回复
+                $reply->nested_replies = $reply->nested_replies ?? collect();
+                $reply->nested_replies->each(function ($nested) {
+                    $nested->nick_name = substrCut2($nested->nick_name);
+                    $nested->images = array_map(fn($url) => yz_tomedia($url), @unserialize($nested->images) ?: []);
+                });
+            });
+
+            return $item;
+        });
+
+        return [
+            'comments' => $comment_data,
+            'stats' => $stats
+        ];
+    }*/
+
+
+
+    public function getComment()
+    {
+        $goods_id = request()->goods_id;
+        $filter = request()->filter;
+        $fieldMapping = [
+            'time' => 'created_at',
+            'score' => 'level',
+        ];
+        $sort = request()->sort;
+        $name = $fieldMapping[$sort] ?? 'created_at';
+
+        // 基础查询条件
+        $baseQuery = Comment::uniacid()
+            ->where('type', 1) // 主评论
+            ->where('goods_id', $goods_id)
+            ->where('is_show', 1);
+
+        // 统计数据
+        $stats = [
+            'all' => (clone $baseQuery)->count(),
+            'good' => (clone $baseQuery)->whereBetween('level', [4, 5])->count(),
+            'medium' => (clone $baseQuery)->where('level', 3)->count(),
+            'bad' => (clone $baseQuery)->whereBetween('level', [1, 2])->count(),
+        ];
+
+        // 主查询
+        $query = (clone $baseQuery)
+            ->with([
+                'orderGoods' => function($query) {
+                    $query->select("id", "components", "goods_option_title", "type");
+                },
+                // 一级回复（直接回复主评论）
+                'hasManyReply' => function($query) {
+                    $query->where('type', 2)
+                        ->where('is_show', 1)
+                        ->with([
+                            // 二级回复（回复的回复）
+                            'hasManyReply' => function($query) {
+                                $query->where('type', 2)
+                                    ->where('is_show', 1);
+                            }
+                        ]);
+                }
+            ]);
+
+        // 筛选条件
+        switch ($filter) {
+            case 'good': $query->whereBetween('level', [4, 5]); break;
+            case 'medium': $query->where('level', 3); break;
+            case 'bad': $query->whereBetween('level', [1, 2]); break;
+        }
+
+        $comment_data = $query->orderBy($name, 'desc')->paginate(5);
+
+        // 转换数据
+        $comment_data->transform(function ($item) {
+            $item->nick_name = substrCut2($item->nick_name);
+            $item->images = array_map(fn($url) => yz_tomedia($url), @unserialize($item->images) ?: []);
+
+            // 处理 orderGoods 数据
+            if ($item->orderGoods) {
+                $item->material_color = $this->getMaterialColor($item->orderGoods->toArray());
+            }
+
+            // 确保一级回复是集合
+            $item->hasManyReply = $item->hasManyReply ?? collect();
+
+            // 临时存储所有回复（一级+二级）
+            $allReplies = collect();
+
+            $item->hasManyReply->each(function ($reply) use (&$allReplies) {
+                // 处理一级回复
+                $reply->nick_name = substrCut2($reply->nick_name);
+                $reply->images = array_map(fn($url) => yz_tomedia($url), @unserialize($reply->images) ?: []);
+
+                // 标记为一级回复（可选）
+                $reply->is_first_level = true;
+                $allReplies->push($reply);
+
+                // 处理二级回复并追加到集合
+                $reply->hasManyReply = $reply->hasManyReply ?? collect();
+                $reply->hasManyReply->each(function ($nested) use (&$allReplies) {
+                    $nested->nick_name = substrCut2($nested->nick_name);
+                    $nested->images = array_map(fn($url) => yz_tomedia($url), @unserialize($nested->images) ?: []);
+
+                    // 标记为二级回复（可选）
+                    $nested->is_first_level = false;
+                    $allReplies->push($nested);
+                });
+            });
+
+            // 替换原始回复为合并后的集合
+            $item->hasManyReply = $allReplies;
+
+            return $item;
+        });
+
+        return [
+            'comments' => $comment_data,
+            'stats' => $stats
+        ];
+    }
+
+
+
+
+
+}

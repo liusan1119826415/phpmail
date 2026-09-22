@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>简单测试</title>
+</head>
+<body>
+    <h1>Three.js 和 Tween.js 本地导入测试</h1>
+    <div id="status"></div>
+    
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "/static/js/three/three.module.js",
+        "three/addons/": "/static/js/three/addons/",
+        "@tweenjs/tween.js": "/static/js/tween.esm.js"
+      }
+    }
+    </script>
+
+    <script type="module">
+        const status = document.getElementById('status');
+        
+        try {
+            // 测试three.js导入
+            const THREE = await import('three');
+            status.innerHTML += '<p style="color: green;">✅ Three.js 导入成功！版本: ' + THREE.REVISION + '</p>';
+            
+            // 测试tween.js导入
+            const TWEEN = await import('@tweenjs/tween.js');
+            status.innerHTML += '<p style="color: green;">✅ Tween.js 导入成功！版本: ' + TWEEN.version + '</p>';
+            
+            // 测试three.js addons导入
+            const { OrbitControls } = await import('three/addons/controls/OrbitControls.js');
+            status.innerHTML += '<p style="color: green;">✅ Three.js OrbitControls 导入成功！</p>';
+            
+        } catch (error) {
+            status.innerHTML += '<p style="color: red;">❌ 导入失败: ' + error.message + '</p>';
+            console.error('导入错误:', error);
+        }
+    </script>
+</body>
+</html>
+

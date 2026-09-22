@@ -1,0 +1,16 @@
+schema_version: 1
+module_path: frontend_style
+title: 前端样式与UI架构体系
+scope: []
+source_files:
+    - static/css/common.css
+    - static/css/bootstrap.min.css
+    - addons/yun_shop/static/app/theme/theme.css
+    - static/yunshop/css/global.css
+    - static/yunshop/element-ui/css/element-ui_2.3.1_theme-chalk_index.css
+    - addons/yun_shop/static/app/vant.css
+    - addons/yun_shop/static/app/mint-ui.css
+    - official/css/main.css
+    - webpack.mix.js
+depends_on: []
+related_to: []

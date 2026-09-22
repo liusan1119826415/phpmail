@@ -1,0 +1,99 @@
+<?php
+/****************************************************************
+ * Author:  libaojia
+ * Date:    2017/9/1 下午4:33
+ * Email:   livsyitian@163.com
+ * QQ:      995265288
+ * User:
+ ****************************************************************/
+
+namespace app\common\services\finance;
+
+
+use app\common\facades\Setting;
+use app\common\models\Order;
+use app\common\modules\order\OrderDeductReturn;
+
+class PointRollbackService
+{
+    /**
+     * @var Order
+     */
+    private $orderModel;
+
+    /**
+     * @param $event
+     * @throws \app\common\exceptions\ShopException
+     */
+    public function orderCancel($event)
+    {
+        // 执行订单赠送积分扣除
+        (new PointRefund())->exec($event);
+
+        if (!Setting::get('point.set.point_rollback')) {
+            return;
+        }
+
+        $this->orderModel = $event->getOrderModel();
+        /**
+         * 返还全额抵扣的积分
+         */
+        $this->rollbackCoinExchange();
+
+
+        //存在售后关联记录关闭的默认是订单退款完成关闭的不需要再次进行处理
+        if (!$this->orderModel->refund_id) {
+
+            $result = (new OrderDeductReturn($this->orderModel, 'point'))->closeReturnTotal();
+            if ($result['status'] && $result['data']['amount']) {
+
+                $this->pointRollback($result['data']['amount']);
+
+            } else {
+                \Log::debug($result['msg']."-{$this->orderModel->order_sn}",$result['data']);
+            }
+
+        }
+    }
+
+    /**
+     * 返还全额抵扣积分
+     * @throws \app\common\exceptions\ShopException
+     */
+    private function rollbackCoinExchange()
+    {
+        $point = $this->orderModel->orderCoinExchanges->where('code', 'point')->first();
+        if (!$point) {
+            return;
+        }
+        $coin = $point['coin'];
+        $data = [
+            'point_income_type' => PointService::POINT_INCOME_GET,
+            'point_mode' => PointService::POINT_MODE_ROLLBACK,
+            'member_id' => $this->orderModel->uid,
+            'order_id' => $this->orderModel->id,
+            'point' => $coin,
+            'remark' => '订单：[' . $this->orderModel->order_sn . ']关闭，返还积分抵扣积分' . $coin,
+        ];
+        (new PointService($data))->changePoint();
+    }
+
+
+    private function pointRollback($point)
+    {
+        return (new PointService($this->getChangeData($point)))->changePoint();
+    }
+
+    private function getChangeData($point)
+    {
+        return [
+            'point_income_type' => PointService::POINT_INCOME_GET,
+            'point_mode' => PointService::POINT_MODE_ROLLBACK,
+            'member_id' => $this->orderModel->uid,
+            'order_id' => $this->orderModel->id,
+            'point' => $point,
+            'remark' => '订单：[' . $this->orderModel->order_sn . ']关闭，返还积分抵扣积分' . $point,
+        ];
+    }
+
+}

@@ -1,0 +1,10 @@
+schema_version: 1
+module_path: business_features
+title: 企业微信业务管理与权限控制
+scope:
+    - business/
+source_files: []
+depends_on: []
+related_to:
+    - path: app_framework
+    - path: plugins_addons

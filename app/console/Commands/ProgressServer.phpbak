@@ -1,0 +1,106 @@
+<?php
+
+namespace app\Console\Commands;
+
+
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Redis;
+use Workerman\Worker;
+use Yunshop\AiDesign\services\UtilsService;
+
+
+class ProgressServer extends Command
+{
+
+
+    protected $signature = 'progress {action} {--d}';
+    protected $description = 'Start the Workerman WebSocket server';
+
+    public function __construct()
+    {
+        parent::__construct();
+    }
+
+    public function handle()
+    {
+
+        $wsWorker = new Worker("websocket://0.0.0.0:2346");
+        $wsWorker->clients = [];
+
+        // 处理客户端连接
+        $wsWorker->onConnect = function ($connection) use ($wsWorker) {
+            $wsWorker->clients[$connection->id] = $connection;
+
+            // 处理来自客户端的消息
+            $connection->onMessage = function ($connection, $data) use ($wsWorker) {
+                $decodedData = json_decode($data, true);
+
+                if (isset($decodedData['task_id'])) {
+                    // 将 task_id 关联到该连接上
+                    $connection->task_id = $decodedData['task_id'];
+                    $connection->task_type = $decodedData['task_type'];
+                }
+            };
+        };
+
+        // 处理客户端断开连接
+        $wsWorker->onClose = function ($connection) use ($wsWorker) {
+            unset($wsWorker->clients[$connection->id]);
+        };
+
+        // 启动时的定时任务
+        $wsWorker->onWorkerStart = function () use ($wsWorker) {
+            // 保存定时器 ID
+            $timerId = \Workerman\Timer::add(1, function () use ($wsWorker, &$timerId) {
+                static $isProcessing = false; // 标志变量
+
+                if ($isProcessing) {
+                    return; // 如果正在处理，则不执行
+                }
+
+
+                $isProcessing = true; // 设置为正在处理
+
+                foreach ($wsWorker->clients as $client) {
+                    \Log::debug("==task_id==",$client->task_id);
+                    if (isset($client->task_id)) {
+
+                        $utilsService = new UtilsService();
+                        $request_data = ['taskId' => $client->task_id, 'task_type' => $client->task_type];
+                        $class_obj = $utilsService->getClassInstance($request_data);
+                        $progressData = $class_obj->getProgress();
+
+
+                            // 否则继续发送进度更新
+                            $client->send(json_encode([
+                                'status' => 'ok',
+                                'task_id' => $client->task_id,
+                                'progress' => $progressData,
+                            ]));
+                        // 检查进度是否达到 100，如果达到则不再发送
+                        if ($progressData['progress'] == 100) {
+                            // 进度达到 100%，断开连接
+                            unset($wsWorker->clients[$client->id]);
+                            $client->close();
+
+                            // 如果所有客户端均已完成，删除定时器
+                            if (empty($wsWorker->clients)) {
+                                \Workerman\Timer::del($timerId);
+                                \Log::debug("All clients completed. Timer deleted.");
+                            }
+                        }
+
+                    }
+                }
+                $isProcessing = false; // 设置为处理完成
+            });
+
+        };
+
+
+
+
+        Worker::runAll();
+    }
+}

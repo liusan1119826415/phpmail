@@ -1,0 +1,17 @@
+schema_version: 1
+module_path: logging_system
+title: 日志系统架构与规范
+scope: []
+source_files:
+    - config/logging.php
+    - app/framework/Log/BaseLog.php
+    - app/framework/Log/SimpleLog.php
+    - app/framework/Log/TraceLog.php
+    - app/framework/Log/CronLog.php
+    - app/framework/Log/ErrorLog.php
+    - app/framework/Log/SqlLog.php
+    - app/framework/Support/Facades/Log.php
+    - app/common/providers/AppServiceProvider.php
+    - app/process/QueueKeeper.php
+depends_on: []
+related_to: []

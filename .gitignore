@@ -1,0 +1,6 @@
+.idea/
+/.vscode/
+/plugins/
+/database/config.php
+/storage/logs/
+/.env

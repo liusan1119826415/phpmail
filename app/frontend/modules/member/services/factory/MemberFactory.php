@@ -1,0 +1,208 @@
+<?php
+/**
+ * Created by PhpStorm.
+ * Author:
+ * Date: 17/2/23
+ * Time: 下午2:27
+ */
+
+namespace app\frontend\modules\member\services\factory;
+
+use app\common\exceptions\ShopException;
+use app\common\helpers\Client;
+use app\common\models\Member;
+use app\frontend\modules\member\services\MemberAnchorAppService;
+use app\frontend\modules\member\services\MemberAppLspWalletService;
+use app\frontend\modules\member\services\MemberAppYdbService;
+use app\frontend\modules\member\services\MemberBusinessScanCodeService;
+use app\frontend\modules\member\services\MemberCpsAppService;
+use app\frontend\modules\member\services\MemberDouyinService;
+use app\frontend\modules\member\services\MemberEmailService;
+use app\frontend\modules\member\services\MemberEmailYdbService;
+use app\frontend\modules\member\services\MemberMiniAppFaceService;
+use app\frontend\modules\member\services\MemberMobileService;
+use app\frontend\modules\member\services\MemberNativeAppService;
+use app\frontend\modules\member\services\MemberPcOfficeAccountService;
+use app\frontend\modules\member\services\MemberStateGrid;
+use app\frontend\modules\member\services\MemberStateGridService;
+use app\frontend\modules\member\services\MemberTFBService;
+use app\frontend\modules\member\services\MemberTiktokService;
+use app\frontend\modules\member\services\MemberTjpCpsService;
+use app\frontend\modules\member\services\MemberWechatService;
+use app\frontend\modules\member\services\MemberAppWechatService;
+use app\frontend\modules\member\services\MemberMiniAppService;
+use app\frontend\modules\member\services\MemberOfficeAccountService;
+use app\frontend\modules\member\services\MemberQQService;
+use app\frontend\modules\member\services\MemberAlipayService;
+use app\frontend\modules\member\services\SmsCodeService;
+use app\frontend\modules\member\services\MemberWechatQrcodeService;
+use Yunshop\Freelogin\common\service\FreeloginService;
+use Yunshop\WechatChatSidebar\frontend\service\MemberWorkService;
+
+
+class MemberFactory
+{
+    const LOGIN_OFFICE_ACCOUNT = 1;
+    const LOGIN_MINI_APP = 2;
+    const LOGIN_APP_WECHAT = 3;
+    const LOGIN_WECHAT = 4;
+    const LOGIN_MOBILE = 5;
+    const LOGIN_QQ = 6;
+    const LOGIN_APP_YDB = 7;
+    const LOGIN_ALIPAY = 8;
+    const LOGIN_Native = 9;
+    const LOGIN_MOBILE_CODE = 10;
+    const LOGIN_DOUYIN = 11;
+    const LOGIN_MINI_APP_FACE = 12;
+    const LOGIN_APP_ANCHOR = 14;
+    const LOGIN_APP_CPS = 15;
+    const LOGIN_PC_OFFICE_ACCOUNT = 16;
+    const LOGIN_WORK = 17;
+    const LOGIN_APP_LSP_WALLET = 18;
+    const LOGIN_BUSINESS_SCAN_CODE = 19; //企业微信pc端扫码登录
+    const LOGIN_STATE_GRID = 20; //国电投对接
+    const LOGIN_TIKTOK = 21;//抖音
+
+    public static function create(&$type = null)
+    {
+        $className = null;
+        $scope = request()->input('scope');
+        $is_pc_qrcode = request()->input('is_pc_qrcode') ?: 0;//1-PC扫码登录 0-否
+        $is_email_register = (int)request()->input('is_email_register') ?: 0;
+
+        if (empty($type) || $type == 'undefined') {
+            $type = Client::getType();
+        }
+
+        switch ($scope) {
+            case 'tfb':
+                return new MemberTFBService();
+            case 'freelogin':
+                if (app('plugins')->isEnabled('freelogin') && \Setting::get('plugin.freelogin_set')['status']) {
+                    return new FreeloginService();
+                }
+                break;
+            case 'tjpcps':
+                if (request()->app_token && app('plugins')->isEnabled('aggregation-cps') && (!request()->appid || \Yunshop\AggregationCps\services\SettingManageService::getTrueKey() == request()->appid)) {
+                    return new MemberTjpCpsService();
+                }
+                break;
+            case 'yearendbox':
+                if (app('plugins')->isEnabled('year-end-box')) {
+                    // 插件: 年末礼盒
+                    return new \Yunshop\YearEndBox\services\YearEndBoxLoginService();
+                }
+                break;
+            case 'jinepay':
+                if (app('plugins')->isEnabled('jinepay')) {
+                    // 插件: 锦银E付
+                    return new \Yunshop\Jinepay\services\LoginService();
+                }
+                break;
+            case 'yzx_pay':
+                if (app('plugins')->isEnabled('code-science-pay') && \Setting::get('code-science-pay.set.plugin_enable')) {
+                    // 插件: 豫章行代金券支付
+                    return new \Yunshop\CodeSciencePay\services\CodeSciencePayLogin();
+                }
+                break;
+        }
+
+        if (Client::setWechatByMobileLogin($type)) {
+            $type = self::LOGIN_MOBILE;
+        }
+
+        $registerSet = \Setting::get('shop.register');
+        if ((!$registerSet['login_mode'] || in_array('mobile_code', $registerSet['login_mode'])) && request()->input('is_sms') == 1) {
+            // todo 待优化，需要考虑其他很多种情况
+            $type = self::LOGIN_MOBILE_CODE;
+        }
+
+        // 小程序-智能相册webview加载
+        if ($type == self::LOGIN_MOBILE && request()->input('webview') == 1) {
+            $type = self::LOGIN_OFFICE_ACCOUNT;
+        }
+
+        switch ($type) {
+            case self::LOGIN_OFFICE_ACCOUNT:
+                $className = new MemberOfficeAccountService();
+                break;
+            case self::LOGIN_MINI_APP:
+                $className = new MemberMiniAppService();
+                break;
+            case self::LOGIN_APP_WECHAT:
+                $className = new MemberAppWechatService();
+                break;
+            case self::LOGIN_WECHAT:
+                $className = new MemberWechatService();
+                break;
+            case self::LOGIN_MOBILE:
+                if ((int)$is_pc_qrcode == 1) {
+                    $className = new MemberWechatQrcodeService();
+                    break;
+                } else {
+                    if (strexists(request()->mobile, '@')) {
+                        $className = new MemberEmailService();
+                    } else {
+                        $className = new MemberMobileService();
+                    }
+                    break;
+                }
+            case self::LOGIN_QQ:
+                $className = new MemberQQService();
+                break;
+            case self::LOGIN_APP_YDB:
+                $className = new MemberAppYdbService();
+                break;
+            case self::LOGIN_ALIPAY:
+                $className = new MemberAlipayService();
+                break;
+            case self::LOGIN_Native:
+                $className = new MemberNativeAppService();
+                break;
+            case self::LOGIN_MOBILE_CODE:
+                $className = new SmsCodeService();
+                break;
+            case self::LOGIN_DOUYIN:
+                $className = new MemberDouyinService();
+                break;
+            case self::LOGIN_MINI_APP_FACE:
+                $className = new MemberMiniAppFaceService();
+                break;
+            case self::LOGIN_APP_ANCHOR:
+                $className = new MemberAnchorAppService();
+                break;
+            case self::LOGIN_APP_CPS:
+                $className = new MemberCpsAppService();
+                break;
+            case self::LOGIN_PC_OFFICE_ACCOUNT:
+                $className = new MemberPcOfficeAccountService();
+                break;
+            case self::LOGIN_WORK:
+                $query_string = $_SERVER['QUERY_STRING'];
+
+                if (strpos($query_string, 'client=work')) {
+                    $className = new MemberWorkService();
+                } else {
+                    $className = new MemberOfficeAccountService();
+                }
+
+                break;
+            case self::LOGIN_APP_LSP_WALLET:
+                $className = new MemberAppLspWalletService();
+                break;
+
+            case self::LOGIN_BUSINESS_SCAN_CODE:
+                $className = new MemberBusinessScanCodeService();
+                break;
+            case self::LOGIN_STATE_GRID:
+                $className = new MemberStateGridService();
+                break;
+            case self::LOGIN_TIKTOK:
+                $className = new MemberTiktokService();
+                break;
+            default:
+                throw new ShopException('应用登录授权失败', ['login_status' => -4]);
+        }
+        return $className;
+    }
+}

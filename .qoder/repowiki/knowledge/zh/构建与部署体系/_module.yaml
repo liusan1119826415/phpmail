@@ -1,0 +1,16 @@
+schema_version: 1
+module_path: build_system
+title: 构建与部署体系
+scope: []
+source_files:
+    - composer.json
+    - package.json
+    - webpack.mix.js
+    - artisan
+    - daemon.sh
+    - cron.php
+    - index.php
+    - config/queue.php
+    - app/Kernel.php
+depends_on: []
+related_to: []

@@ -1,0 +1,133 @@
+<?php
+/**
+ * Created by PhpStorm.
+ *
+ *
+ *
+ * Date: 2023/4/19
+ * Time: 17:38
+ */
+
+namespace app\Jobs;
+
+use app\common\facades\Setting;
+use app\common\models\Goods;
+use app\common\models\GoodsOption;
+use app\common\services\upload\UploadService;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use app\common\models\goods\GoodsOptionModelUrl;
+use Symfony\Component\HttpFoundation\File\UploadedFile;
+
+class UploadModelJob implements ShouldQueue
+{
+    use InteractsWithQueue, Queueable, SerializesModels;
+
+
+    protected $pdf;
+
+    public $tries = 1;
+
+
+
+    public $timeout = 300;
+
+
+    public $option_id;
+
+    public $fileData;
+
+
+    public $uniacid;
+
+    public $type;
+
+    /**
+     * Create a new job instance.
+     *
+     * @return void
+     */
+    public function __construct($option_id,$uniacid,$fileData=[])
+    {
+        $this->option_id = $option_id;
+        $this->fileData = $fileData;
+        $this->uniacid = $uniacid;
+
+    }
+
+    /**
+     * @return bool|void
+     */
+    public function handle()
+    {
+        \YunShop::app()->uniacid = Setting::$uniqueAccountId = $this->uniacid;
+
+
+
+        foreach ($this->fileData as $file){
+            $fullPath = $file['fullPath'];
+            $fileName = $file['fileName'];
+            $this->uploadModel($fullPath,$fileName);
+        }
+
+
+
+
+    }
+
+    protected function uploadModel($fullPath,$fileName)
+    {
+        $waitTime = 0;
+        while (!file_exists($fullPath) && $waitTime < 10) {
+            sleep(1); // 每秒检查一次
+            $waitTime++;
+        }
+        \Log::debug("============模型文件上传====");
+        if (!file_exists($fullPath)) {
+            \Log::error("超时未找到文件，无法上传: " . $fullPath);
+            return;
+        }
+
+        $d3ModelUrl_weld = $this->uploadOssTwo($fullPath, $fileName);
+        $file_arr = explode(".",$fileName);
+        GoodsOptionModelUrl::create([
+            'option_id'=>$this->option_id,
+            'name'=>$file_arr[0],
+            'model_url'=>$d3ModelUrl_weld
+        ]);
+    }
+
+
+
+
+    private function uploadOssTwo($save_path, $file_name)
+    {
+
+        $uploadedFile = new UploadedFile(
+            $save_path,
+            $file_name,
+            mime_content_type($save_path),
+            null,
+            true // Mark as test file to avoid further validation
+        );
+
+        $uploadService = new UploadService();
+        $upload_res = $uploadService->uploadTwo($uploadedFile, "file", "files");
+
+        $relative_path = $upload_res['relative_path'];
+        return $relative_path;
+    }
+
+
+    private function uploadOss($file)
+    {
+
+        $uploadService = new UploadService();
+        $upload_res = $uploadService->uploadTwo($file, "file", "files");
+
+        $relative_path = $upload_res['relative_path'];
+        return $relative_path;
+    }
+}

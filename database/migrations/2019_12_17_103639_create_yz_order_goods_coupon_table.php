@@ -1,0 +1,70 @@
+<?php
+
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Database\Migrations\Migration;
+use app\common\facades\Setting;
+use app\common\models\UniAccount;
+
+class CreateYzOrderGoodsCouponTable extends Migration
+{
+    /**
+     * Run the migrations.
+     *
+     * @return void
+     */
+    public function up()
+    {
+        if (!Schema::hasTable('yz_order_goods_coupon')) {
+            Schema::create('yz_order_goods_coupon', function (Blueprint $table) {
+                $table->increments('id');
+                $table->integer('uniacid');
+                $table->integer('order_goods_id')->comment('订单商品id');
+                $table->integer('coupon_id')->comment('优惠券id');
+                $table->integer('coupon_several')->default(1)->comment('预计发放数量');
+                $table->tinyInteger('send_type')->default(1)->comment('发放方式 0 每月1号0:00发放  1 订单完成后的1分钟后发放  2 订单付款后的1分钟后发放 3 订单付款后每隔N天赠送一次，一共送X次');
+                $table->integer('send_num')->default(0)->comment('发放数量。字段名和原流程一致');
+                $table->integer('end_send_num')->default(0)->comment('已发放。字段名和原流程一致');
+                $table->boolean('status')->default(0)->comment('状态 -1 关闭 0 等待 1已发放');
+                $table->string('remark')->nullable()->comment('备注');
+                $table->string('num_reason')->nullable()->comment('应发几张和实发几张不一致时原因');
+                $table->integer('created_at')->nullable();
+                $table->integer('updated_at')->nullable();
+                $table->unique(['order_goods_id', 'coupon_id'], 'order_goods_id_coupon_id');
+            });
+
+            \Illuminate\Support\Facades\DB::statement("ALTER TABLE `".app('db')->getTablePrefix()."yz_order_goods_coupon` comment'订单--商品购买订单赠送优惠券'");//表注释
+
+
+        }
+        if(Schema::hasTable('yz_order_goods_coupon'))
+        {
+            $uniAccount = UniAccount::get() ?: [];
+            foreach ($uniAccount as $u) {
+                Setting::$uniqueAccountId = \YunShop::app()->uniacid = $u->uniacid;
+                $orders = \app\common\models\Order::uniacid()
+                    ->whereIn('status',[\app\common\models\Order::WAIT_PAY,\app\common\models\Order::WAIT_SEND,\app\common\models\Order::WAIT_RECEIVE])
+                    ->get();
+                if(!$orders->isEmpty())
+                {
+                    foreach ($orders as $order)
+                    {
+                        $orderGoods = $order->hasManyOrderGoods;//订单商品
+                        $couponService = new \app\frontend\modules\coupon\services\CouponService($order, null, $orderGoods);
+                        $couponService->sendCouponLog();
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Reverse the migrations.
+     *
+     * @return void
+     */
+    public function down()
+    {
+        //
+    }
+}

@@ -1,0 +1,1811 @@
+<?php
+
+namespace app\frontend\modules\project\infrastructure;
+
+use app\common\exceptions\AppException;
+use app\common\models\goods\GoodsOptionModel;
+use app\common\models\GoodsSpecItem;
+use app\frontend\models\GoodsOption;
+use app\frontend\modules\coupon\models\Goods;
+use app\frontend\modules\member\models\MemberFavorite;
+use app\frontend\modules\project\repositories\DiyModelRepositoryInterface;
+use Illuminate\Support\Facades\Cache;
+use app\common\models\project\CloudDesign;
+use app\common\models\project\Project;
+use app\common\models\project\Floors;
+use app\common\models\project\FloorSpace;
+use app\common\models\MemberCart;
+use app\frontend\modules\project\services\AssemblyGoodsService;
+use Illuminate\Support\Facades\DB;
+use app\frontend\modules\goods\models\Brand;
+use app\frontend\modules\project\models\SearchSupplier;
+use app\common\models\Address;
+use app\common\models\Category;
+use app\common\models\goods\GoodsRelation;
+use app\common\models\project\Issue;
+use app\common\models\project\IssueOptions;
+use app\frontend\modules\project\models\Project as ModelsProject;
+use Overtrue\Pinyin\Pinyin;
+use Illuminate\Support\Facades\Redis;
+use app\frontend\modules\project\services\GoodsComparator;
+use Yunshop\Supplier\common\models\SupplierColorPlane;
+use app\frontend\modules\project\models\CaseModel;
+use app\common\traits\ProcessGoodsOptionTrait;
+use app\frontend\modules\project\services\related\GoodsOptionQueryService;
+use app\frontend\modules\project\services\related\GoodsOptionDataBuilder;
+
+use app\frontend\modules\project\services\related\CurrentGoodsOptionHandler;
+
+class DiyModelRepository extends BaseRepository implements DiyModelRepositoryInterface
+{
+    use ProcessGoodsOptionTrait;
+    const FREECOM = 5; //自由组合
+
+    const SELECT_STRING = '"id", "goods_id", "supp_id", "title", "thumb", "product_price", "cad_plan_model", "length", "width", "height", "d3ModelUrl_weld", "thumb3dModelUrl", "spec_item_id", "block_name", "modelType", "specs", "singleType as single", "structure","mirror_enable"';
+
+    /**
+     * @param int $projec_id
+     * @return array
+     * 检测是否覆盖
+     */
+    public function checkOverlap(int $project_id): array
+    {
+        $design = CloudDesign::select('id', 'name', 'project_id')->find($project_id);
+        if (!$design->project_id) {
+            return ['check_status' => 0];
+        }
+        $project = Project::find($design->project_id);
+        if ($project->order_status == 1) {
+            return ['check_status' => 2];
+        }
+
+        $result = MemberCart::where('project_id', $design->project_id)->exists();
+        return ['check_status' => $result ? 1 : 0];
+    }
+
+    /**
+     * 查询商品状态
+     */
+    public function getGoodsStatusAll(array $goodsIds): array
+    {
+        $data =  Goods::select('id', 'status')->whereIn('id', $goodsIds)->get()->toArray();
+        return $data;
+    }
+
+    /**
+     * 获取方案详情
+     */
+    public function getDesignDetail($designId): array
+    {
+
+        $design = CloudDesign::select('id', 'name', 'thumbnail', 'design_data')->where('id', $designId)->first();
+
+        if (!$design) {
+            return [];
+        }
+
+        return $design->toArray();
+    }
+    /**
+     * @param int $goods_id
+     * @return array
+     * 获取系列产品
+     */
+    public function seriesGoods(int $goods_id): array
+    {
+        $goodsData = $this->getGoodsData($goods_id);
+        return $goodsData;
+    }
+
+    /**
+     * @param int $goods_id
+     * @return array
+     * 获取关联产品
+     */
+
+    // public function relatedProducts(int $goods_id): array
+    // {
+    //     // 获取当前商品的供应商ID
+    //     $current_goods = DB::table('yz_goods')->where('id', $goods_id)->first();
+    //     $current_supp_id = $current_goods ? $current_goods->supp_id : null;
+
+    //     $related_goods_ids = GoodsRelation::selectRaw('CASE WHEN goods_id = ? THEN related_goods_id ELSE goods_id END as related_id', [$goods_id])
+    //         ->where(function ($query) use ($goods_id) {
+    //             // 正向关联：goods_id = 当前商品
+    //             $query->where('goods_id', $goods_id);
+    //         })
+    //         ->orWhere(function ($query) use ($goods_id, $current_supp_id) {
+    //             // 反向关联：related_goods_id = 当前商品，但只关联相同供应商的商品
+    //             $query->where('related_goods_id', $goods_id)
+    //                 ->whereHas('relatedGoodsInfo', function ($q) use ($current_supp_id) {
+    //                     $q->where('supp_id', $current_supp_id);
+    //                 });
+    //         })
+    //         ->pluck('related_id')
+    //         ->unique()
+    //         ->toArray();
+
+    //     $related_goods_data = [];
+    //     if (!empty($related_goods_ids)) {
+    //         $goodsList = \app\common\models\GoodsOption::select("id", "title", "goods_id", "product_price", "thumb", "is_discount", "is_hot")
+    //             ->whereHas('goods', function ($query) {
+    //                 $query->where('type2', 1)->where('status', 1);
+    //             })
+    //             ->with(['goods:id,title,is_stock,supp_id'])
+    //             ->where('is_default', 1)
+    //             ->whereIn('goods_id', $related_goods_ids)
+    //             ->whereNotNull('thumb3dModelUrl')
+    //             // 确保关联商品与当前商品供应商相同
+    //             ->whereHas('goods', function ($query) use ($current_supp_id) {
+    //                 $query->where('supp_id', $current_supp_id);
+    //             })
+    //             ->get();
+
+    //         $related_goods_data = $goodsList->map(function ($item) {
+    //             return [
+    //                 'id' => $item->id,
+    //                 'goods_id' => $item->goods_id,
+    //                 'title' => $item->goods->title . explode("+", $item->title)[0],
+    //                 'price' => ceil($item->product_price),
+    //                 'thumb' => yz_tomedia($item->thumb),
+    //                 "is_discount" => $item->is_discount,
+    //                 "is_hot" => $item->is_hot,
+    //                 "is_stock" => $item->goods->is_stock
+    //             ];
+    //         })->all();
+    //     }
+
+    //     // 系列产品
+    //     $seriesGoods = $this->getGoodsData($goods_id);
+    //     return ['relatedGoods' => $related_goods_data, 'seriesGoods' => $seriesGoods];
+    // }
+
+
+    /**
+     * 获取关联产品（已整合到系列产品中）
+     * @param int $goods_id
+     * @return array
+     */
+    public function relatedProducts(int $goods_id): array
+    {
+        // 直接返回包含关联选项的系列产品数据
+        $seriesGoods = $this->getGoodsData($goods_id);
+        return ['seriesGoods' => $seriesGoods, 'relatedGoods' => []];
+    }
+
+
+    /**
+     * 获取我的收藏
+     */
+    public function getMyCollect(): array
+    {
+        $member_id = \YunShop::app()->getMemberId();
+
+        // 1. 查询用户的所有收藏记录（包含 mirror_type）
+        $favorites = MemberFavorite::where("member_id", $member_id)
+            ->orderBy('created_at', 'desc')
+            ->get(['option_id', 'mirror_type', 'current_goods_id', 'created_at']);
+
+        if ($favorites->isEmpty()) {
+            return ['data' => [], 'current_page' => 1, 'total' => 0];
+        }
+
+        // ========== 新增：合并同一 option_id 下的左右镜像收藏 ==========
+        // 按 option_id 分组，若同时存在 mirror_type=1 和 2，则只保留一条（保留创建时间最新的）
+        $mergedFavorites = collect();
+        $grouped = $favorites->groupBy('option_id');
+        foreach ($grouped as $optionId => $items) {
+            $hasLeft = $items->contains('mirror_type', 1);
+            $hasRight = $items->contains('mirror_type', 2);
+            if ($hasLeft && $hasRight) {
+                // 同时有左右镜像，只保留创建时间最新的一条（可根据业务调整保留规则，例如优先保留左镜像）
+                $keep = $items->sortByDesc('created_at')->first();
+                $mergedFavorites->push($keep);
+            } else {
+                // 无冲突，全部保留
+                foreach ($items as $item) {
+                    $mergedFavorites->push($item);
+                }
+            }
+        }
+        // 重新按创建时间倒序排序，并重置索引
+        $favorites = $mergedFavorites->sortByDesc('created_at')->values();
+        // ========== 合并结束 ==========
+
+        // 2. 按 option_id 分组，用于后续关联 GoodsOption
+        $optionIds = $favorites->pluck('option_id')->unique()->values()->toArray();
+
+        // 3. 批量查询 GoodsOption 基础信息（不变）
+        $goodsOptions = GoodsOption::select(
+            "id",
+            "goods_id",
+            "supp_id",
+            "title",
+            "thumb",
+            "product_price",
+            "cad_plan_model",
+            "length",
+            "width",
+            "height",
+            "d3ModelUrl_weld",
+            "thumb3dModelUrl",
+            "spec_item_id",
+            "block_name",
+            "modelType",
+            "specs",
+            "singleType as single",
+            "structure",
+            "mirror_enable"
+        )
+            ->with([
+                'specOne' => function ($q) {
+                    $q->select("id", "title");
+                },
+                'goods'    => function ($q) {
+                    $q->select("id", "title", "lead_time", "status");
+                },
+                'beLongsToSupplier' => function ($q) {
+                    $q->select("id", "store_name");
+                }
+            ])
+            ->whereIn('id', $optionIds)
+            ->get()
+            ->keyBy('id');
+
+        // 4. 收集其他关联数据所需的 ID（不变）
+        $specItemIds = $goodsOptions->pluck('spec_item_id')->filter()->unique()->toArray();
+        $optionIdsForModel = $goodsOptions->keys()->toArray();
+
+        $specItems = GoodsSpecItem::whereIn('id', $specItemIds)->pluck('productType', 'id')->toArray();
+        $modelParams = $this->getOptionModels($optionIdsForModel);
+        $parentModels = $this->getAllOptionParentModels($optionIdsForModel, $modelParams);
+
+        // 5. 构建分页数据：基于合并后的收藏记录集合
+        $page = request()->input('page', 1);
+        $perPage = 20;
+        $total = $favorites->count();  // 注意：total 已基于合并后的数量
+        $paginatedFavorites = $favorites->forPage($page, $perPage);
+
+        $resultData = [];
+        foreach ($paginatedFavorites as $fav) {
+            $optionId = $fav->option_id;
+            $mirror_type = $fav->mirror_type;
+
+            $item = $goodsOptions->get($optionId);
+            if (!$item) {
+                continue;
+            }
+
+            $item = clone $item;
+            $item->mirror_type_in_favorite = $mirror_type;
+
+            // 处理收藏状态（与原逻辑相同）
+            if ($mirror_type == 0) {
+                $collect_data = ['status' => 1, 'message' => '商品已收藏', 'mirror_type' => 0];
+            } elseif ($mirror_type == 1) {
+                $collect_data = ['status' => 1, 'message' => '商品已收藏（左镜像）', 'mirror_type' => 1];
+            } else { // 2
+                $collect_data = ['status' => 1, 'message' => '商品已收藏（右镜像）', 'mirror_type' => 2];
+            }
+            $item['is_favorite'] = $collect_data;
+
+            // 其他字段处理（与原逻辑相同）
+            $item['thumb'] = yz_tomedia($item->thumb ?? '');
+            $item['cad_plan_model'] = yz_tomedia($item->cad_plan_model ?? '');
+            $item['price'] = ceil($item->product_price);
+            $item['option_last_title'] = end(explode("+", $item->title));
+            $item['title'] = $item->goods->title . explode("+", $item->title)[0] . ($mirror_type == 1 ? '(左)' : ($mirror_type == 2 ? '(右)' : ''));
+            $item['d3ModelUrl_weld'] = yz_tomedia($item->d3ModelUrl_weld ?? '');
+            $item['thumb3dModelUrl'] = yz_tomedia($item['thumb3dModelUrl'] ?? '');
+            $item['modelSlim'] = $item->modelSlim ? unserialize($item->modelSlim) : [];
+            $item['model_data'] = array_values($modelParams[$optionId] ?? []);
+            $item['model_chilren_data'] = $parentModels[$item->specs] ?? [];
+            $item['productType'] = $specItems[$item->spec_item_id] ?? null;
+            $item['lead_time'] = $item->goods->lead_time ?? '';
+            $item['mirror_enable'] = $item->mirror_enable;
+            $item['status'] = $item->goods->status;
+
+            $item['current_goods_id'] = $fav->current_goods_id;
+
+            $resultData[] = $item;
+        }
+
+        // 6. 构造分页返回格式
+        return [
+            'current_page' => $page,
+            'data' => $resultData,
+            'total' => $total,
+            'per_page' => $perPage,
+            'last_page' => ceil($total / $perPage),
+        ];
+    }
+
+
+    /**
+     * 获取产品品类条件
+     */
+    public function getSearchCategory(): array
+    {
+        $brand = Brand::select("id", "name")->get()->toArray();
+        return $brand;
+    }
+
+    /**
+     * 获取查询条件产地
+     */
+    public function getSearchPlace(): array
+    {
+        $cityIds = SearchSupplier::where('status', 1)->where('role_id', 1)->where('enable', 1)->pluck("province_id")->all();
+        $city_list = Address::select("id", "areaname")->whereIn("id", $cityIds)->get()->toArray();
+
+        if ($city_list) {
+            $pinyin = new Pinyin(); // 使用 Overtrue Pinyin 库
+            foreach ($city_list as $k => $item) {
+
+                $firstChar = mb_substr($item['areaname'], 0, 1);
+
+                // 获取第一个字的拼音首字母（转大写）
+                $city_list[$k]['first_letter'] = strtoupper($pinyin->abbr($firstChar));
+            }
+        }
+        return $city_list;
+    }
+
+
+
+    /**
+     * 修改方案名称
+     */
+    public function renameDesign(int $designId, string $name): bool
+    {
+        $design = CloudDesign::findOrFail($designId);
+        $design->name = $name;
+        return $design->save();
+    }
+
+    /**
+     * 删除方案
+     */
+    public function deleteDesign(int $designId): bool
+    {
+        $design = CloudDesign::findOrFail($designId);
+        return $design->delete();
+    }
+
+    /**
+     * 回收站方案列表
+     */
+    public function designRecycleList(array $search): array
+    {
+
+        $member_id = \YunShop::app()->getMemberId();
+
+        $query = CloudDesign::uniacid()->select("id", "name", "created_at", "updated_at", "deleted_at")->where('member_id', $member_id)->withTrashed()->whereNotNull('deleted_at');
+        if ($search['name']) {
+            $query->where('name', 'like', '%' . $search['name'] . '%');
+        }
+
+
+
+        $search['start_date'] = $search['start_date'] ? strtotime($search['start_date']) : "";
+        $search['end_date'] = $search['end_date'] ? strtotime(date('Y-m-d', strtotime($search['end_date'])) . ' 23:59:59') : null;
+
+        // 也可以按创建时间筛选
+        if (!empty($search['start_date']) && !empty($search['end_date'])) {
+            $query->whereBetween('created_at', [$search['start_date'], $search['end_date']]);
+        } elseif (!empty($search['start_date'])) {
+            $query->where('created_at', '>=', $search['start_date']);
+        } elseif (!empty($search['end_date'])) {
+            $query->where('created_at', '<=', $search['end_date']);
+        }
+
+        $query->orderBy('deleted_at', 'desc');
+
+        $data = $query->paginate(self::PAGE_SIZE);
+
+        return $data ? $data->toArray() : [];
+    }
+
+    /**
+     * 恢复方案
+     */
+    public function restoreDesign(int $designId): bool
+    {
+        $design = CloudDesign::withTrashed()->findOrFail($designId);
+        return $design->restore();
+    }
+
+
+    /** 
+     * 上传dwg或dxf 文件
+     */
+
+    public function uploadDwg(): array
+    {
+
+        // 接收单个文件
+        $file = request()->file('file');
+
+        if (!$file) {
+            throw new AppException('请上传文件');
+        }
+
+        $originalName = $file->getClientOriginalName();
+        $extension = strtolower($file->getClientOriginalExtension());
+
+        // 验证文件类型
+        if (!in_array($extension, ['dwg', 'dxf'])) {
+            throw new AppException('只支持 DWG 或 DXF 文件格式');
+        }
+
+
+
+
+        // 根据文件类型调用不同的处理方法
+        if ($extension === 'dwg') {
+            // DWG 文件处理逻辑
+            // 保存文件到 uploads 目录
+            $filePath = $file->storeAs('uploads', $originalName);
+            $response = $this->curl_analysis_cad("search_block", $filePath);
+            if ($response['data']['status_code'] == 200) {
+                $dxf_file = $response['data']['dxf_file'];
+                $dxf_url = "https://" . Request()->getHost() . "/dxf/{$dxf_file}";
+                return ['url' => $dxf_url, 'originalName' => $originalName];
+            } else {
+                throw new AppException($response['data']['message']);
+            }
+        } else {
+            // DXF 文件处理逻辑
+            $response = uploadOss($file, $originalName); // 假设这是处理 DXF 的方法
+            return ['url' => $response['absolute_path'], 'originalName' => $originalName];
+        }
+    }
+
+    /**
+     * 保存方案
+     */
+    public function saveDesign(array $data): array
+    {
+
+
+        $data['design_data'] = $this->toJson($data['design_data']);
+
+
+
+        return $this->transaction(function () use ($data) {
+            // 基础数据验证
+            if (empty($data['name'])) {
+                throw new \Exception('方案名称不能为空');
+            }
+
+            if ($data['imgBase64'] ?? null) {
+                $thumb = self::uploadOssThumb($data['imgBase64']);
+            }
+
+            // 处理项目保存逻辑
+            $projectId = null;
+            if ($data['id']) {
+                $design = CloudDesign::where('id', $data['id'])
+                    ->first();
+                $project_id = $design->project_id;
+            }
+            if (($data['save_project'] ?? 0) == 1) {
+                // 需要保存项目
+                $projectData = [
+                    'uniacid' => \YunShop::app()->uniacid,
+                    'member_id' => \YunShop::app()->getMemberId(),
+                    'name' => $data['name'], // 如果没有提供项目名称，则使用方案名称
+
+                ];
+
+                // 如果提供了项目ID，则更新项目；否则创建新项目
+                if (!empty($project_id)) {
+                    $project = Project::where('id', $project_id)
+                        ->where('member_id', \YunShop::app()->getMemberId())
+                        ->firstOrFail();
+                    $project->fill($projectData);
+                    $project->save();
+                    $projectId = $project->id;
+                } else {
+                    $project = new Project($projectData);
+                    $project->save();
+                    $projectId = $project->id;
+                }
+            }
+
+            // 准备保存到CloudDesign的数据
+            $saveData = [
+                'uniacid' => \YunShop::app()->uniacid,
+                'member_id' => \YunShop::app()->getMemberId(),
+                'name' => $data['name'],
+                //  'price' => $data['price'] ?? 0.00,
+                'thumbnail' => $thumb ?? '',
+                'design_data' => $data['design_data'] ?? null,
+
+            ];
+            if ($projectId) {
+                $saveData['project_id'] = $projectId;
+            }
+
+            // 如果有id则为更新，否则为新增
+            $old_design_data = [];
+            if (!empty($data['id'])) {
+
+                // 更新操作
+
+                //获取上一次保存的数据
+                $old_design_data = $design->design_data;
+
+                // 更新模型属性
+                $design->fill($saveData);
+
+                // 执行保存
+                $result = $design->save();
+            } else {
+                // 新增操作
+                $saveData['created_at'] = time();
+                $design = new CloudDesign($saveData);
+                $result = $design->save();
+            }
+
+            // 如果有design_data且projectId不为空，则处理楼层、空间和购物车商品
+            if (!empty($data['design_data']) && $data['save_project'] == 1) {
+                if ($project->order_status == 1) {
+                    throw new AppException('项目订单已经提交，不能覆盖');
+                }
+
+                $this->handleDesignData($data['design_data'], $projectId, $old_design_data);
+            }
+
+            return ['id' => $design->id];
+        });
+    }
+
+    /**
+     * 方案管理列表
+     */
+
+    public function designList(array $search): array
+    {
+
+        $member_id = \YunShop::app()->getMemberId();
+        $page_size = request()->input('page_size');
+        $sort = $search['sort'] ?? 'created_desc'; // 设置默认值
+
+        $query = CloudDesign::uniacid()->select("id", "name", "thumbnail", "created_at", "updated_at")->where('member_id', $member_id);
+
+        if ($search['name']) {
+            $query->where('name', 'like', '%' . $search['name'] . '%');
+        }
+
+
+        $search['start_date'] = $search['start_date'] ? strtotime($search['start_date']) : null;
+        $search['end_date'] = $search['end_date'] ? strtotime(date('Y-m-d', strtotime($search['end_date'])) . ' 23:59:59') : null;
+
+        if (!empty($search['start_date']) && !empty($search['end_date'])) {
+            $query->whereBetween('created_at', [$search['start_date'], $search['end_date']]);
+        } elseif (!empty($search['start_date'])) {
+            $query->where('created_at', '>=', $search['start_date']);
+        } elseif (!empty($search['end_date'])) {
+            $query->where('created_at', '<=', $search['end_date']);
+        }
+        // 根据sort参数进行排序
+        switch ($sort) {
+            case 'created_desc': // 创建时间降序（默认）
+                $query->orderBy('created_at', 'desc');
+                break;
+            case 'updated_desc': // 更新时间降序（最近更新的在前）
+                $query->orderBy('updated_at', 'desc');
+                break;
+            case 'updated_asc': // 更新时间升序
+                $query->orderBy('updated_at', 'asc');
+                break;
+            default:
+                $query->orderBy('created_at', 'desc');
+                break;
+        }
+        $data = $query->paginate($page_size ?: self::PAGE_SIZE);
+        $data->transform(function ($item) {
+            $item->thumbnail = $item->thumbnail ? yz_tomedia($item->thumbnail) : "";
+            $item->time_text = $this->formatTimeText($item->created_at);
+
+            return $item;
+        });
+
+        return $data->toArray();
+    }
+
+    /**
+     * 获取推荐行业案例
+     */
+    public function getRecommendIndustry(): array
+    {
+        $query = CaseModel::select("id", "title", "favorites_count")->where('is_suggested', 1)->get();
+        $query->transform(function ($item) {
+            $item->url = yzWebFullUrlV2("case/" . $item->id);
+            return $item;
+        });
+        return $query->toArray();
+    }
+
+    /**
+     * 获取反馈问题list
+     */
+    public function getIssueOptions(): array
+    {
+        $query = IssueOptions::select("id", "title", "parent_id")->where('status', 1)->with(['children' => function ($query) {
+            $query->select("id", "title", "parent_id")->where('status', 1);
+        }])->where('parent_id', 0)->get();
+
+        return $query->toArray();
+    }
+
+    /**
+     * 提交反馈问题
+     */
+    public function submitIssue(array $data): bool
+    {
+        $issue = new Issue();
+        $data['member_id'] = \YunShop::app()->getMemberId();
+        $data['content'] = htmlspecialchars($data['content']);
+        $data['issue_id'] = $data['issue_id'];
+        $data['issue_parent'] = $data['issue_parent'];
+        $data['thumb_url'] = $data['thumb_url'] ?? '';
+        $data['file_url'] = $data['file_url'] ?? '';
+        $issue->fill($data);
+        return $issue->save();
+    }
+
+    /**
+     * 判断格式是否为数组，为json就转数组
+     */
+    public function toJson($data): array
+    {
+        if (is_array($data)) {
+            return $data;
+        }
+        $json = json_decode($data, true);
+        if (json_last_error() === JSON_ERROR_NONE) {
+            return $json;
+        }
+        return [];
+    }
+
+
+    /**
+     * 格式化时间显示
+     * @param int $timestamp 时间戳
+     * @return string
+     */
+    private function formatTimeText($timestamp): string
+    {
+        $now = time();
+        $diff = $now - $timestamp;
+
+        // 1分钟内
+        if ($diff < 60) {
+            return '刚刚';
+        }
+
+        // 1小时内
+        if ($diff < 3600) {
+            $minutes = floor($diff / 60);
+            return $minutes . '分钟前';
+        }
+
+        // 24小时内
+        if ($diff < 86400) {
+            $hours = floor($diff / 3600);
+            return $hours . '小时前';
+        }
+
+        // 30天内
+        if ($diff < 2592000) {
+            $days = floor($diff / 86400);
+            return $days . '天前';
+        }
+
+        // 1年内
+        if ($diff < 31536000) {
+            return date('m-d', $timestamp);
+        }
+
+        // 超过1年
+        return date('Y-m-d', $timestamp);
+    }
+
+    /**
+     * 真实删除
+     */
+    public function deleteDesignReal(int $designId): bool
+    {
+        $design = CloudDesign::withTrashed()->findOrFail($designId);
+        return $design->forceDelete();
+    }
+
+
+    /**
+     * 复制设计方案
+     *
+     * @param int $designId 原方案ID
+     * @param int $memberId 新的用户ID（可选，不传则使用原方案的member_id）
+     * @return bool
+     */
+    public function duplicateDesign($designId): bool
+    {
+        $memberId = \YunShop::app()->getMemberId();
+        return DB::transaction(function () use ($designId, $memberId) {
+            // 查找原方案
+            $original = CloudDesign::findOrFail($designId);
+
+            // 生成唯一的副本名称
+            $newName = $this->generateDuplicateName($original->name, $original->member_id);
+
+            // 创建副本
+            $duplicate = new CloudDesign();
+            $duplicate->uniacid = $original->uniacid;
+            $duplicate->member_id = $memberId ?: $original->member_id;
+            $duplicate->province_id = $original->province_id;
+            $duplicate->city_id = $original->city_id;
+            $duplicate->district_id = $original->district_id;
+            $duplicate->name = $newName;
+            $duplicate->price = $original->price;
+            $duplicate->thumbnail = $original->thumbnail;
+            $duplicate->design_data = $original->design_data;
+            $duplicate->created_at = time();
+            $duplicate->updated_at = time();
+
+            $duplicate->save();
+
+            return true;
+        });
+    }
+
+    /**
+     * 生成唯一的副本名称
+     *
+     * @param string $originalName 原名称
+     * @param int $memberId 用户ID
+     * @return string
+     */
+    private function generateDuplicateName($originalName, $memberId)
+    {
+        $baseName = $this->getBaseName($originalName);
+        $newName = $baseName . '_副本';
+
+        $counter = 1;
+        $finalName = $newName;
+
+        // 检查名称是否已存在，如果存在则递增数字
+        while ($this->nameExists($finalName, $memberId)) {
+            $finalName = $newName . $counter;
+            $counter++;
+        }
+
+        return $finalName;
+    }
+
+    /**
+     * 获取基础名称（去除已有的副本后缀）
+     *
+     * @param string $name
+     * @return string
+     */
+    private function getBaseName($name)
+    {
+        // 如果名称已经包含"_副本"，则去除副本部分
+        if (preg_match('/^(.*)_副本\d*$/', $name, $matches)) {
+            return $matches[1];
+        }
+
+        // 如果名称以"_副本"结尾，去除
+        if (str_ends_with($name, '_副本')) {
+            return substr($name, 0, -3);
+        }
+
+        return $name;
+    }
+
+    /**
+     * 检查名称是否已存在
+     *
+     * @param string $name
+     * @param int $memberId
+     * @return bool
+     */
+    private function nameExists($name, $memberId)
+    {
+        return CloudDesign::where('member_id', $memberId)
+            ->where('name', $name)
+            ->exists();
+    }
+
+    /**
+     * 处理design_data，创建或更新楼层、空间和购物车商品
+     *
+     * @param array $designData 设计数据
+     * @param int $projectId 项目ID
+     * @return void
+     */
+    protected function handleDesignData(array $designData, int $projectId, array $old_design_data): void
+    {
+        if (empty($designData['floors'])) {
+            return;
+        }
+        $member_id = \YunShop::app()->getMemberId();
+        //判断当前项目是否激活
+        $project = Project::find($projectId);
+        $activate = $project->activate;
+        $spaceIds = FloorSpace::where('project_id', $projectId)->pluck("id")->toArray();
+        foreach ($spaceIds as $space_id) {
+            $cacheKey = "member_cart_list_{$member_id}_{$space_id}";
+            Cache::forget($cacheKey);
+        }
+        $goodsIds = MemberCart::where('project_id', $projectId)->where('type', 2)->pluck("goods_id")->toArray();
+
+        // 获取现有楼层ID列表，用于后续删除不需要的楼层
+        // Floors::where('project_id', $projectId)->delete();
+        // FloorSpace::where('project_id', $projectId)->delete();
+        MemberCart::where('project_id', $projectId)->forceDelete();
+        Goods::whereIn('id', $goodsIds)
+            ->forceDelete();
+        GoodsOption::whereIn('goods_id', $goodsIds)
+            ->delete();
+
+        Redis::del("user:{$member_id}:active_project_1");
+
+        // 处理每个楼层
+        $this->processFloors($projectId, $designData['floors']);
+        foreach ($designData['floors'] as $floorIndex => $floorData) {
+            // 创建或更新楼层
+            $floor = $this->updateOrCreateFloor($projectId, $floorData, $floorIndex, $activate);
+
+            // 处理每个空间
+            if (!empty($floorData['spaces'])) {
+                $this->processSpaces($projectId, $floorData['spaces'], $floor->id);
+                foreach ($floorData['spaces'] as $spaceIndex => $spaceData) {
+                    // 创建或更新空间
+                    $space = $this->updateOrCreateSpace($projectId, $floor->id, $spaceData, $spaceIndex, $activate);
+
+                    // 处理商品列表
+                    if (!empty($spaceData['goodsList'])) {
+                        $this->handleGoodsList($projectId, $floor->id, $space->id, $spaceData['goodsList'], $old_design_data);
+                    }
+                }
+            }
+        }
+    }
+
+
+    private function processFloors(int $projectId, array $floorsData)
+    {
+        $importedUuids = collect($floorsData)->pluck('uuid')->filter()->toArray();
+
+        // 删除不在本次导入中的楼层（软删除或硬删除）
+        Floors::where('project_id', $projectId)
+            ->where(function ($query) use ($importedUuids) {
+                // 处理没有导入UUID的情况
+                if (empty($importedUuids)) {
+                    // 如果没有导入任何UUID，删除所有楼层
+                    $query->whereNotNull('uuid');
+                } else {
+                    // 删除既不在导入列表中又不是NULL的记录
+                    $query->whereNotIn('uuid', $importedUuids)
+                        ->orWhereNull('uuid');
+                }
+            })->delete();
+    }
+
+    private function processSpaces(int $projectId, array $spacesData, int $floorId)
+    {
+        $importedUuids = collect($spacesData)->pluck('uuid')->filter()->toArray();
+
+        FloorSpace::where('project_id', $projectId)->where('floor_id', $floorId)
+            ->where(function ($query) use ($importedUuids) {
+                // 处理没有导入UUID的情况
+                if (empty($importedUuids)) {
+                    // 如果没有导入任何UUID，删除所有楼层
+                    $query->whereNotNull('uuid');
+                } else {
+                    // 删除既不在导入列表中又不是NULL的记录
+                    $query->whereNotIn('uuid', $importedUuids)
+                        ->orWhereNull('uuid');
+                }
+            })
+            ->delete();
+    }
+
+    /**
+     * 创建或更新楼层
+     *
+     * @param int $projectId 项目ID
+     * @param array $floorData 楼层数据
+     * @param int $floorIndex 楼层索引
+     * @return Floors
+     */
+    protected function updateOrCreateFloor(int $projectId, array $floorData, int $floorIndex, int $activate): Floors
+    {
+        $uuid = $floorData['uuid'] ?? null;
+        $floor = Floors::where('uuid', $uuid)->where('project_id', $projectId)->first();
+        if ($floor) {
+            // 更新现有楼层
+            $floor->name = $floorData['name'] ?? "楼层" . ($floorIndex + 1);
+            $floor->sort = $floorIndex;
+
+            $floor->save();
+        } else {
+            // 创建新楼层
+            $floor = new Floors();
+            $floor->project_id = $projectId;
+            if ($activate) {
+                $floor->activate = $floorIndex == 0 ? 1 : 0;
+            }
+            $floor->uuid = $uuid;
+            $floor->name = $floorData['name'] ?? "楼层" . ($floorIndex + 1);
+            $floor->sort = $floorIndex;
+            $floor->save();
+        }
+
+        return $floor;
+    }
+
+    /**
+     * 创建或更新空间
+     *
+     * @param int $projectId 项目ID
+     * @param int $floorId 楼层ID
+     * @param array $spaceData 空间数据
+     * @param int $spaceIndex 空间索引
+     * @return FloorSpace
+     */
+    protected function updateOrCreateSpace(int $projectId, int $floorId, array $spaceData, int $spaceIndex, int $activate): FloorSpace
+    {
+        $spaceId = $spaceData['uuid'] ?? null;
+        $space = FloorSpace::where('uuid', $spaceId)->where('project_id', $projectId)->first();
+
+        if ($space) {
+            // 更新现有空间
+            $space->name = $spaceData['name'] ?? "空间" . ($spaceIndex + 1);
+            $space->sort = $spaceIndex;
+            $space->save();
+        } else {
+            // 创建新空间
+            $space = new FloorSpace();
+            $space->project_id = $projectId;
+            $space->floor_id = $floorId;
+            if ($activate) {
+                $space->activate = $spaceIndex == 0 ? 1 : 0;
+            }
+
+            $space->name = $spaceData['name'] ?? "空间" . ($spaceIndex + 1);
+            $space->uuid = $spaceId;
+            $space->sort = $spaceIndex;
+            $space->save();
+        }
+
+        return $space;
+    }
+
+    /**
+     * 处理商品列表
+     *
+     * @param int $projectId 项目ID
+     * @param int $floorId 楼层ID
+     * @param int $spaceId 空间ID
+     * @param array $goodsList 商品列表
+     * @param int $memberId 会员ID
+     * @param int $uniacid 公众号ID
+     * @return void
+     */
+    protected function handleGoodsList(int $projectId, int $floorId, int $spaceId, array $goodsList, array $old_design_data): void
+    {
+        // 创建一个排序队列，记录每个索引位置应该插入什么类型的商品
+        $insertQueue = [];
+
+        // 获取自由组合的商品统计
+        $groupedStats = $this->processGroupGoods($goodsList);
+
+        if ($groupedStats) {
+            // 处理自由组合商品 - 每个组只创建一个队列项
+            foreach ($groupedStats as $groupedStat) {
+                // 获取这个组包含的所有原索引
+                $indices = $groupedStat['goods_indices'] ?? [];
+
+                if (!empty($indices)) {
+                    // 使用最小索引作为排序依据
+                    $minIndex = min($indices);
+
+                    $insertQueue[$minIndex] = [
+                        'type' => 'freecom',
+                        'data' => $groupedStat,
+                        'processed' => false,
+                        'all_indices' => $indices  // 保存所有索引，用于后续处理
+                    ];
+                }
+            }
+        }
+
+        // 处理拼接商品
+        $comparator = new GoodsComparator();
+        $groupGoodsList = $comparator->compareGoods($goodsList);
+
+        foreach ($groupGoodsList as $gData) {
+            $goodsData = $gData['sample_data'];
+
+            $goods_count = $gData['count'];
+          
+
+            if (!empty($goodsData['data']) && $goodsData['data']['productType'] != self::FREECOM) {
+                $indices = $gData['goods_indices'] ?? [];
+
+                if (!empty($indices)) {
+                    // 使用最小索引作为排序依据
+                    $minIndex = min($indices);
+
+                    $insertQueue[$minIndex] = [
+                        'type' => 'combined',
+                        'data' => [
+                            'goodsData' => $goodsData,
+                            'goods_count' => $goods_count,
+                            'groupData' => $gData
+                        ],
+                        'processed' => false,
+                        'all_indices' => $indices  // 保存所有索引，用于后续处理
+                    ];
+                }
+            }
+        }
+
+        // 第三步：按索引排序（键已经是索引，直接排序即可）
+        ksort($insertQueue);
+
+        // 第四步：获取当前最大排序值（如果需要可以从数据库查询）
+        $maxSort = 0; // 这里应该从数据库获取当前已有的最大排序值
+
+        // 第五步：按顺序插入数据
+        $sort = $maxSort + 1;
+
+        foreach ($insertQueue as $minIndex => $item) {
+            
+            if ($item['type'] == 'freecom') {
+         
+                // 处理自由组合商品
+                $this->processSingleGoods(
+                    $projectId,
+                    $floorId,
+                    $spaceId,
+                    $item['data'],
+                    $sort
+                );
+            } else {
+                // 处理拼接商品
+                $this->processCombinedGoods(
+                    $projectId,
+                    $floorId,
+                    $spaceId,
+                    $item['data']['goodsData'],
+                    $old_design_data,
+                    $item['data']['goods_count'],
+                    $sort
+                );
+            }
+            $sort++;
+        }
+    }
+    // //分组统计商品
+    // private function processGroupGoods($goodsList)
+    // {
+    //     $groupedStats = collect($goodsList)
+    //         ->filter(function ($item) {
+    //             // 只处理 productType == 5 的商品
+    //             return (isset($item['data']['productType']) && $item['data']['productType'] == 5) ||
+    //                 (isset($item['children']) && count($item['children']) == 1);
+    //         })
+    //         ->groupBy(function ($item) {
+    //             // 按照 goods_id, id, productType 和 镜像状态 进行分组
+    //             $scale = $item['scale'] ?? ['x' => 1, 'y' => 1, 'z' => 1];
+    //             $isMirror = ($scale['x'] * $scale['z'] < 0) ? '_mirror' : '_normal';
+
+    //             return $item['data']['goods_id'] . '_' .
+    //                 $item['data']['id'] . '_' .
+    //                 $item['data']['productType'] . $isMirror;
+    //         })
+    //         ->map(function ($group, $key) use ($goodsList) {
+    //             // 返回分组统计结果
+    //             $firstItem = $group->first();
+    //             $scale = $firstItem['scale'] ?? ['x' => 1, 'y' => 1, 'z' => 1];
+    //             $isMirrored = ($scale['x'] * $scale['z'] < 0);
+
+    //             // 获取组内所有商品的索引
+    //             $indices = [];
+    //             foreach ($group as $item) {
+    //                 foreach ($goodsList as $index => $originalItem) {
+    //                     if (
+    //                         isset($originalItem['goods_uuid']) && isset($item['goods_uuid']) &&
+    //                         $originalItem['goods_uuid'] == $item['goods_uuid']
+    //                     ) {
+    //                         $indices[] = $index;
+    //                         break; // 找到后跳出内层循环
+    //                     }
+    //                 }
+    //             }
+
+    //             return [
+    //                 'goods_id' => $firstItem['data']['goods_id'],
+    //                 'option_id' => $firstItem['data']['id'],
+    //                 'productType' => $firstItem['data']['productType'],
+    //                 'is_mirrored' => $isMirrored,
+    //                 'scale' => $scale,
+    //                 'total' => $group->count(),
+    //                 'data' => $firstItem['data'],
+    //                 'children' => $firstItem['children'],
+    //                 'goods_indices' => $indices, // 现在返回所有索引的数组
+    //             ];
+    //         })
+    //         ->values()
+    //         ->toArray();
+
+    //     return $groupedStats;
+    // }
+
+
+
+    //分组统计商品
+    private function processGroupGoods($goodsList)
+    {
+        $groupedStats = collect($goodsList)
+            ->filter(function ($item) {
+                // 只处理 productType == 5 的商品
+                return (isset($item['data']['productType']) && $item['data']['productType'] == 5) ||
+                    (isset($item['children']) && count($item['children']) == 1);
+            })
+            ->groupBy(function ($item) {
+                // 计算镜像状态
+                $scale = $item['scale'] ?? ['x' => 1, 'y' => 1, 'z' => 1];
+                $isMirror = ($scale['x'] * $scale['z'] < 0) ? '_mirror' : '_normal';
+
+                // 判断是否为定制商品（productType==5 且 is_customized === true）
+                $isCustomized = isset($item['customized']['is_customized']) && $item['customized']['is_customized'] === true
+                    && isset($item['data']['productType']) && $item['data']['productType'] == 5;
+
+                if ($isCustomized) {
+                    // 定制商品：使用 goods_id + 去除空格后的定制备注 + 镜像状态 作为分组键
+                    $remark = $item['customized']['customized_remark'] ?? '';
+                    $remarkKey = preg_replace('/\s+/u', '', $remark); // 去除所有空白字符
+                    return $item['data']['goods_id'] . '_custom_' . $remarkKey . $isMirror;
+                } else {
+                    // 普通商品：按 goods_id, id, productType, 镜像状态分组
+                    return $item['data']['goods_id'] . '_' .
+                        $item['data']['id'] . '_' .
+                        $item['data']['productType'] . $isMirror;
+                }
+            })
+            ->map(function ($group, $key) use ($goodsList) {
+                // 返回分组统计结果
+                $firstItem = $group->first();
+                $scale = $firstItem['scale'] ?? ['x' => 1, 'y' => 1, 'z' => 1];
+                $isMirrored = ($scale['x'] * $scale['z'] < 0);
+
+                // 获取组内所有商品在原始数组中的索引
+                $indices = [];
+                foreach ($group as $item) {
+                    foreach ($goodsList as $index => $originalItem) {
+                        if (
+                            isset($originalItem['goods_uuid']) && isset($item['goods_uuid']) &&
+                            $originalItem['goods_uuid'] == $item['goods_uuid']
+                        ) {
+                            $indices[] = $index;
+                            break;
+                        }
+                    }
+                }
+
+                return [
+                    'goods_id' => $firstItem['data']['goods_id'],
+                    'option_id' => $firstItem['data']['id'],
+                    'productType' => $firstItem['data']['productType'],
+                    'is_mirrored' => $isMirrored,
+                    'scale' => $scale,
+                    'total' => $group->count(),
+                    'data' => $firstItem['data'],
+                    'children' => $firstItem['children'],
+                    'goods_indices' => $indices,
+                    'is_customized' => $firstItem['customized']['is_customized'],
+                    // 可选：如果分组是定制商品，可以附带定制备注信息（便于调试）
+                    'customized_remark' => isset($firstItem['customized']['is_customized']) && $firstItem['customized']['is_customized']
+                        ? ($firstItem['customized']['customized_remark'] ?? '')
+                        : null,
+                ];
+            })
+            ->values()
+            ->toArray();
+
+        return $groupedStats;
+    }
+
+    /**
+     * 处理单个商品
+     *
+     * @param int $projectId 项目ID
+     * @param int $floorId 楼层ID
+     * @param int $spaceId 空间ID
+     * @param array $goodsData 商品数据
+     * @param int $memberId 会员ID
+     * @param int $uniacid 公众号ID
+     * @param array $processedCartIds 已处理的购物车ID列表
+     * @return void
+     */
+    protected function processSingleGoods(int $projectId, int $floorId, int $spaceId, array $goodsInfo, int $sort): void
+    {
+
+
+
+        $params['goods_id'] = $goodsInfo['goods_id'] ?? null;
+        $params['option_id'] = $goodsInfo['option_id'] ?? null;
+        $params['total'] = $goodsInfo['total'] ?? 1;
+        $params['space_id'] = $spaceId;
+        $params['floor_id'] = $floorId;
+        $params['project_id'] = $projectId;
+        $params['sort'] = $sort;
+        $params['type'] =  1;
+        $params['is_customized'] = $goodsInfo['is_customized'] ? 1 : 0;
+        $params['customized_remark'] = $goodsInfo['customized_remark'] ?? null;
+        $params['is_mirrored'] = $goodsInfo['is_mirrored'] ? 1 : 0;
+        $params['components'] = [];
+        if (count($goodsInfo['children']) == 1) {
+            $model_chilren_data = $goodsInfo['children'][0]['model_chilren_data'];
+            foreach ($model_chilren_data as $key => $item) {
+                if ($goodsInfo['data']['id'] == $item['id']) {
+                    $params['components'] = $this->getColorData($item);
+                }
+            }
+        } else {
+            $params['components'] = $this->getColorData($goodsInfo['data']);
+        }
+
+
+
+        $this->spliceGoods($params);
+
+        // $project_model = Project::find($projectId);
+
+        // //加入到空间
+        // $spaceRepository = new SpaceRepository($project_model);
+        // $spaceRepository->addSpace($params);
+
+    }
+
+
+
+    /**
+     * 获取部件颜色处理数据
+     */
+    private function getColorData($component_data)
+    {
+        $model_data = $component_data['model_data'];
+        $components = [];
+
+        foreach ($model_data as $key => $value) {
+            if ($value['visible'] == 0 && $value['changeLock'] == 1) {
+                $new_data['component_id'] = $value['id'];
+                $new_data['color_id'] = $value['curColor']['id'];
+                $components[] = $new_data;
+            }
+        }
+
+        return $components;
+    }
+
+    /**
+     * 获取部件颜色处理数据string
+     */
+    private function getColorDataString($component_data)
+    {
+        $model_data = $component_data['model_data'];
+        $components = [];
+
+        foreach ($model_data as $key => $value) {
+            $component_name = $value['name'];
+            $color_name = $value['curColor']['name'];
+
+            // 生成 "颜色名称/部件名称" 格式的字符串
+            $color_component_string = $color_name . '/' . $component_name;
+            $components[] = $color_component_string;
+        }
+
+        // 将数组用换行符连接成一个字符串
+        return implode("\n", $components);
+    }
+
+    /**
+     * 处理拼接商品
+     *
+     * @param int $projectId 项目ID
+     * @param int $floorId 楼层ID
+     * @param int $spaceId 空间ID
+     * @param array $goodsData 商品数据
+     * @return void
+     */
+    protected function processCombinedGoods(int $projectId, int $floorId, int $spaceId, array $goodsData, array $old_design_data, int $goods_count, int $sort): void
+    {
+        $current_model = $this->getCurrentModelData($goodsData);
+        $components_string = $this->getColorDataString($current_model);
+
+
+        $result = $this->assembleGoodsData($projectId, $floorId, $spaceId, $goodsData, $components_string, $goods_count, $sort);
+        //获取当前组合商品数据里面的model_type 下标是否一致
+
+        // if($old_design_data){
+        //     foreach ($old_design_data['floors'] as $key => $value) {
+
+        //         if($value['spaces']){
+        //             foreach ($value['spaces'] as $k => $v) {
+        //                    foreach($v['goodsList'] as $kk => $vv){
+        //                            if($vv['data']['productType'] != self::FREECOM && $goodsData['goods_uuid'] == $vv['goods_uuid']){
+
+        //                                 // 验证旧的children跟新的children的modelType是否一致
+        //                                  $isModelTypeSame = $this->compareModelTypes($goodsData, $vv);
+        //                                  //如果相同则更新数据
+        //                                  $goodsModel = Goods::where('goods_uuid', $goodsData['goods_uuid'])->first();
+        //                                  if($isModelTypeSame && $goodsModel){ 
+
+        //                                      $goodsOption = GoodsOption::where('goods_id',$goodsModel->id)->first();
+        //                                      $updateData['project_id'] = $projectId;
+        //                                      $updateData['space_id'] = $spaceId;
+        //                                      $updateData['goods_id'] = $goodsModel->id;
+        //                                      $updateData['floor_id'] = $floorId;
+        //                                      $updateData['option_id'] = $goodsOption->id;
+        //                                      $updateData['total'] = $goods_count;
+        //                                      $updateData['jsonData'] = $goodsData['dwg_data'];
+        //                                      $updateData['modelData'] = json_encode($goodsData);
+        //                                      $updateData['type'] = 2;
+
+
+        //                                      $updateData['components'] = $components_string;
+        //                                      $this->spliceGoods($updateData);
+
+
+        //                                  }else{
+        //                                     //生成拼接新的商品数据
+
+        //                                     $result = $this->assembleGoodsData($projectId, $floorId, $spaceId, $goodsData, $components_string,$goods_count);
+
+        //                                  }
+
+        //                            }else{
+
+        //                             //生成拼接新的商品数据
+        //                             $result = $this->assembleGoodsData($projectId, $floorId, $spaceId, $goodsData, $components_string,$goods_count);
+        //                            }
+        //                    }
+        //             }
+        //         }
+        //     }
+        // }else{
+        //     //生成拼接新的商品数据
+        //     $result = $this->assembleGoodsData($projectId, $floorId, $spaceId, $goodsData, $components_string, $goods_count);
+        // }
+    }
+
+
+
+
+
+
+    /**
+     * 组装商品数据并处理
+     * 
+     * @param int $projectId 项目ID
+     * @param int $floorId 楼层ID
+     * @param int $spaceId 空间ID
+     * @param array $goodsData 商品数据
+     * @param string $components_string 组件字符串
+     * @return array 处理结果
+     */
+    private function assembleGoodsData($projectId, $floorId, $spaceId, $goodsData, $components_string, $goods_count, $sort)
+    {
+        $addcomData = [];
+
+        $addcomData['project_id'] = $projectId;
+        $addcomData['floor_id'] = $floorId;
+        $addcomData['space_id'] = $spaceId;
+
+
+        $addcomData['goods_id'] = $goodsData['data']['goods_id'];
+
+        $optionIds = (new GoodsComparator)->findModelChildrenDataOptionIds($goodsData['children']);
+
+        $addcomData['optionIds'] = $optionIds;
+        $addcomData['is_customized'] = $goodsData['customized']['is_customized'] ? 1 : 0;
+        $addcomData['customized_remark'] = $goodsData['customized']['is_customized'] ? $goodsData['customized']['customized_remark'] ?? null : null;
+        $addcomData['jsonData'] = $goodsData['dwg_data'];
+        $addcomData['base64thumb'] = $goodsData['imgBase64'];
+        $addcomData['optionData'] = $optionIds;
+        $addcomData['productType'] = $goodsData['productType'];
+        $addcomData['goods_uuid'] = $goodsData['goods_uuid'];
+        $addcomData['modelData'] = json_encode($goodsData);
+        $addcomData['components'] = $components_string;
+        $addcomData['total'] = $goods_count;
+
+        $service = new AssemblyGoodsService;
+        $result = $service->assembleDwg($addcomData, false);
+
+
+        $addcomData['goods_id'] = $result['goods_id'];
+        $addcomData['option_id'] = $result['option_id'];
+        $addcomData['type'] = 2;
+        $addcomData['sort'] = $sort;
+
+
+        return $this->spliceGoods($addcomData);
+    }
+
+
+    /**
+     * 获取current model 数据
+     */
+    private function getCurrentModelData($goodsData)
+    {
+        foreach ($goodsData['children'] as $key1 => $value1) {
+            foreach ($value1['model_chilren_data'] as $key2 => $value2) {
+                if ($value1['modelType'] == $value2['modelType']) {
+                    return $value2;
+                }
+            }
+        }
+        return [];
+    }
+
+    /**
+     * 拼接商品加入购物车数据
+     */
+
+    private function spliceGoods(array $data): void
+    {
+        $data['components'] = is_array($data['components']) ? json_encode($data['components']) : $data['components'];
+        $data = array(
+            'member_id' => \YunShop::app()->getMemberId(),
+            'uniacid' => \YunShop::app()->uniacid,
+            'project_id' => $data['project_id'],  //项目id
+            'space_id' => $data['space_id'],  //空间id
+            'floor_id' => $data['floor_id'],  //楼层id
+            'type' => $data['type'],
+            'goods_id' => $data['goods_id'],
+            'is_customized' => $data['is_customized'] ?: 0,  //是否定制
+            'customized_remark' => $data['customized_remark'] ?: null,  //定制备注
+            'sort' => $data['sort'],
+            'total' => $data['total'],
+            'option_id' => $data['option_id'] ?: 0,
+            'components' => $data['components'],
+            'components_hash' => md5($data['components']),
+            'jsonData' => $data['jsonData'] ?: "",
+            'modelData' => $data['modelData'] ?: "",
+            'is_mirrored' => $data['is_mirrored'] ?: 0,
+        );
+
+        $cartModel = app('OrderManager')->make('MemberCart', $data);
+
+        // 直接保存，跳过所有验证
+        if (!$cartModel->save()) {
+            throw new AppException("写入出错，加入空间失败！！！");
+        }
+    }
+
+
+
+    /**
+     * 比较新旧数据的modelType顺序和数量
+     */
+    private function compareModelTypes(array $newData, array $oldData): bool
+    {
+        $newModelTypes = $this->extractModelTypes($newData);
+        $oldModelTypes = $this->extractModelTypes($oldData);
+
+        // 比较数组是否完全相同（包括顺序和值）
+        return $newModelTypes === $oldModelTypes;
+    }
+
+    /**
+     * 提取modelType数组
+     */
+    private function extractModelTypes(array $goodsData): array
+    {
+        $modelTypes = [];
+
+        if (isset($goodsData['children']) && is_array($goodsData['children'])) {
+            foreach ($goodsData['children'] as $child) {
+                // 从children中提取modelType
+                if (isset($child['modelType'])) {
+                    $modelTypes[] = $child['modelType'];
+                }
+            }
+        }
+
+        return $modelTypes;
+    }
+
+
+
+    protected function getGoodsData(int $goods_id): array
+    {
+
+        $cacheKey = "diy_model_goods_data_{$goods_id}";
+        $data = Cache::get($cacheKey);
+        if ($data) return $data;
+
+        $queryService = new GoodsOptionQueryService();
+        $builder = new GoodsOptionDataBuilder($this);
+        $handler = new CurrentGoodsOptionHandler($goods_id, $queryService, $builder);
+        $data = $handler->fetch();
+
+        Cache::put($cacheKey, $data, 24 * 60 + rand(10, 99));
+        return $data;
+    }
+
+
+
+
+
+
+
+
+    // protected function getGoodsData(int $goods_id): array
+    // {
+    //     $cacheKey = "diy_model_goods_data_{$goods_id}";
+
+    //     $data = Cache::get($cacheKey);
+
+    //     if ($data) {
+    //         return $data;
+    //     }
+
+    //     $goods_option_data = GoodsOption::select("id", "goods_id", "supp_id", "title", "thumb", "product_price", "cad_plan_model", "length", "width", "height", "d3ModelUrl_weld", "thumb3dModelUrl", "spec_item_id", "block_name", "modelType", "specs", "singleType as single", "structure", "mirror_enable", "spec_item_id")
+    //         ->with([
+    //             'specOne' => function ($query) {
+    //                 $query->select("id", "title");
+    //             },
+    //             'goods' => function ($query) {
+    //                 $query->select("id", "title", "lead_time", "sku", 'status');
+    //             },
+    //             'beLongsToSupplier' => function ($query) {
+    //                 $query->select("id", "store_name");
+    //             },
+    //             // 直接预加载分类数据，避免N+1查询
+    //             'specCategory' => function ($query) {
+    //                 $query->where('category_type', 2)
+    //                     ->with(['category' => function ($q) {
+    //                         $q->select('id', 'name', 'parent_id');
+    //                     }]);
+    //             }
+    //         ])
+    //         ->whereNotNull('thumb3dModelUrl')
+    //         ->where('modelType', 0)
+    //         ->where('goods_id', $goods_id)
+    //         ->get();
+
+    //     if ($goods_option_data->isEmpty()) {
+    //         return [];
+    //     }
+
+    //     $specItemIds = $goods_option_data->pluck('spec_item_id')->filter()->unique()->toArray();
+    //     $specItems = GoodsSpecItem::whereIn('id', $specItemIds)
+    //         ->pluck('productType', 'id')
+    //         ->toArray();
+
+    //     $optionIds = $goods_option_data->pluck('id')->toArray();
+    //     $data = $goods_option_data->toArray();
+    //     $modelParams = $this->getOptionModels($optionIds);
+    //     $parentModels = $this->getAllParentDiyModels($goods_id);
+
+    //     foreach ($data as &$option) {
+    //         // 处理分类信息
+    //         $category_id = null;
+    //         $category_name = null;
+    //         // 找到对应的原始模型对象
+    //         $originalOption = $goods_option_data->firstWhere('id', $option['id']);
+
+    //         if ($originalOption && $originalOption->specCategory && $originalOption->specCategory->isNotEmpty()) {
+    //             $firstSpecCategory = $originalOption->specCategory->first();
+
+    //             if ($firstSpecCategory && $firstSpecCategory->category) {
+    //                 $category = $firstSpecCategory->category;
+    //                 $category_id = $category->id;
+    //                 $category_name = $category->name;
+    //             }
+    //         }
+
+    //         // 添加分类信息到option中
+    //         $option['category_id'] = $category_id;
+    //         $option['category_name'] = $category_name;
+
+    //         $model_data = $modelParams[$option['id']] ?? collect();
+    //         $option['thumb'] = yz_tomedia($option['thumb'] ?? '');
+
+    //         $collect = MemberFavorite::getFavoriteByOptionId($option['id'], \YunShop::app()->getMemberId());
+    //         $collect_data = [
+    //             'status' => $collect ? 1 : 0,
+    //             'message' => $collect ? '商品已收藏' : "商品未收藏"
+    //         ];
+
+    //         $option['is_favorite'] = $collect_data;
+    //         $option['cad_plan_model'] = yz_tomedia($option['cad_plan_model'] ?? '');
+    //         $option['price'] = ceil($option['product_price']);
+    //         // 修正：确保goods数组存在
+    //         $goodsTitle = $option['goods']['title'] ?? '';
+    //         $optionTitleParts = explode("+", $option['title'] ?? '');
+    //         $option['title'] = $goodsTitle . ($optionTitleParts[0] ?? '');
+    //         $option['d3ModelUrl_weld'] = yz_tomedia($option['d3ModelUrl_weld'] ?? '');
+    //         $option['thumb3dModelUrl'] = yz_tomedia($option['thumb3dModelUrl'] ?? '');
+    //         $option['modelSlim'] = isset($option['modelSlim']) && $option['modelSlim'] ? unserialize($option['modelSlim']) : [];
+    //         $option['model_data'] = array_values($model_data);
+    //         $option['model_chilren_data'] = $parentModels[$option['specs']] ?? [];
+    //         $option['productType'] = $specItems[$option['spec_item_id']] ?? '';
+    //         $option['lead_time'] = $option['goods']['lead_time'] ?? '';
+    //         $option['sku'] = $option['goods']['sku'] ?? '';
+    //         $option['mirror_enable'] = $option['mirror_enable'] ?? 0;
+    //         $option['status'] = $option['goods']['status'];
+    //         // 只在最后移除goods，确保上面的代码能访问到goods数据
+    //         unset($option['goods']);
+    //     }
+
+    //     Cache::put($cacheKey, $data, 24 * 60 + rand(10, 99));
+    //     return $data;
+    // }
+
+
+
+
+
+
+    private function getAllOptionParentModels($optionIds, $allOptionModels)
+    {
+        // 一次性查出所有相关option（兼容多ID拼接）
+        $allOptions = GoodsOption::whereIn('id', $optionIds)
+            ->with(['beLongsToSupplier' => function ($query) {
+                $query->select("id", "store_name");
+            }])
+            ->get();
+
+        // 构建返回结构
+        $parentModels = [];
+
+        $specItemIds = $allOptions->pluck('spec_item_id')->filter()->unique()->toArray();
+
+        // 批量查询GoodsSpecItem数据
+        if (!empty($specItemIds)) {
+            $specItems = GoodsSpecItem::whereIn('id', $specItemIds)
+                ->pluck('productType', 'id')
+                ->toArray();
+        } else {
+            $specItems = [];
+        }
+
+        // 按 specs 分组处理
+        $specsGroups = [];
+        foreach ($allOptions as $option) {
+            $specsGroups[$option->specs][] = $option;
+        }
+
+        // 处理每个 specs 组
+        foreach ($specsGroups as $specsKey => $options) {
+            $specModelData = [];
+
+            foreach ($options as $option) {
+                $productType = $specItems[$option->spec_item_id] ?? null;
+                $optionId = $option->id;
+                $model_data = $allOptionModels[$optionId] ?? collect();
+
+                // 构建选项数据
+                $specModelData[] = [
+                    "id" => $optionId,
+                    "goods_id" => $option->goods_id,
+                    "d3ModelUrl_weld" => $option->d3ModelUrl_weld ? yz_tomedia($option->d3ModelUrl_weld) : "",
+                    "cad_plan_model" => $option->cad_plan_model ? yz_tomedia($option->cad_plan_model) : "",
+                    "thumb3dModelUrl" => $option->thumb3dModelUrl ? yz_tomedia($option->thumb3dModelUrl) : "",
+                    "thumb" => yz_tomedia($option->thumb),
+                    "blockname" => $option->block_name,
+                    "price" => $option->product_price,
+                    'productType' => $productType,
+                    "modelType" => $option->modelType,
+                    "single" => $option->singleType,
+                    "model_data" => array_values($model_data),
+                    "length" => $option->length,
+                    "width" => $option->width,
+                    "height" => $option->height,
+                    "be_longs_to_supplier" => $option->beLongsToSupplier,
+                ];
+            }
+
+            if (!empty($specModelData)) {
+                $parentModels[$specsKey] = $specModelData;
+            }
+        }
+
+        return $parentModels;
+    }
+
+
+
+
+
+    public function getOptionModels($optionIds)
+    {
+        $models = GoodsOptionModel::select("id", "option_id", "name", "changeLock", "default_color", "select_color", "map_param", "visible", "sort")
+            ->whereIn('option_id', $optionIds)
+            ->get()
+            ->groupBy('option_id');
+
+        // 收集所有颜色ID
+        $allColorIds = $models->flatMap(function ($items) {
+            return $items->flatMap(function ($item) {
+                $colorIds = [];
+
+                $default_color = $this->safeUnserialize($item->default_color);
+                $select_color = $this->safeUnserialize($item->select_color);
+
+                // 提取 default_color 的 ID
+                if (isset($default_color['id'])) {
+                    $colorIds[] = $default_color['id'];
+                }
+
+                // 提取 select_color 的 IDs
+                if (is_array($select_color)) {
+                    foreach ($select_color as $color) {
+                        if (isset($color['id'])) {
+                            $colorIds[] = $color['id'];
+                        }
+                    }
+                }
+
+                return $colorIds;
+            });
+        })->unique()->toArray();
+
+        // 一次性查询所有颜色数据
+        $colorDataMap = [];
+        if (!empty($allColorIds)) {
+            $colorDataMap = SupplierColorPlane::select("id", "name", "thumb")
+                ->whereIn('id', $allColorIds)
+                ->get()
+                ->keyBy('id')
+                ->toArray();
+        }
+
+        // 处理数据
+        return $models->map(function ($items) use ($colorDataMap) {
+            return $items->sortBy('sort')->map(function ($item) use ($colorDataMap) {
+                $default_color = $this->safeUnserialize($item->default_color);
+                $select_color = $this->safeUnserialize($item->select_color);
+                $item->map_param = $this->safeUnserialize($item->map_param);
+
+                // 处理 default_color
+                if (isset($default_color['id']) && isset($colorDataMap[$default_color['id']])) {
+                    $colorId = $default_color['id'];
+                    $default_color['thumb'] = yz_tomedia($colorDataMap[$colorId]['thumb']);
+                    $default_color['name'] = $colorDataMap[$colorId]['name'];
+                }
+
+                // 处理 select_color
+                if (is_array($select_color)) {
+                    foreach ($select_color as &$color) {
+                        if (isset($color['id']) && isset($colorDataMap[$color['id']])) {
+                            $colorId = $color['id'];
+                            $color['thumb'] = yz_tomedia($colorDataMap[$colorId]['thumb']);
+                            $color['name'] = $colorDataMap[$colorId]['name'];
+                        }
+                    }
+                    unset($color); // 解除引用
+                }
+                $item->default_color = $default_color;
+                $item->select_color = $select_color;
+
+                return $item;
+            });
+        })->toArray();
+    }
+
+    private function safeUnserialize($value)
+    {
+        return !empty($value) ? @unserialize($value) : [];
+    }
+}

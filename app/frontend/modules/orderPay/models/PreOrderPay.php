@@ -1,0 +1,119 @@
+<?php
+/**
+ * Created by PhpStorm.
+ * User: shenyang
+ * Date: 2018/6/6
+ * Time: 下午3:41
+ */
+
+namespace app\frontend\modules\orderPay\models;
+
+use app\common\events\order\BeforeOrderPayValidateEvent;
+use app\common\exceptions\AppException;
+use app\common\models\PayType;
+use app\frontend\models\Member;
+use app\common\models\Order;
+use app\frontend\models\OrderPay;
+use app\frontend\modules\order\OrderCollection;
+use app\frontend\modules\order\services\OrderService;
+use Illuminate\Database\Eloquent\Collection;
+use app\common\models\OrderGoods;
+
+class PreOrderPay extends OrderPay
+{
+    /**
+     * @param OrderCollection $orders
+     * @throws AppException
+     */
+    public function setOrders(OrderCollection $orders,$pendingPayAmount,$is_discount=0)
+    {
+
+
+        $this->order_ids = $orders->pluck('id');
+        $this->order_id = $orders->first()->id;
+        if($orders->first()->parent_id == 0){
+            $this->project_id = $orders->first()->project_id;
+        }
+
+        $this->amount = $pendingPayAmount;//$orders->sum('price');
+        $this->uid = $orders->first()->uid;
+        $this->is_discount = $is_discount;
+        $this->income_type = $orders->first()->order_type;
+        $this->pay_sn = OrderService::createPaySN();
+        $this->payment_stage = $orders->first()->payment_stage;
+
+        $this->validateOrders($orders);
+    }
+
+    /**
+     * @param Collection $orders
+     * @throws AppException
+     */
+    private function validateOrders(Collection $orders)
+    {
+        $orders->each(function (Order $order) {
+           /* if ($order->status > Order::WAIT_PAY) {
+                throw new AppException('(ID:' . $order->id . ')订单已付款,请勿重复付款');
+            }*/
+            if ($order->status == Order::CLOSE) {
+                throw new AppException('(ID:' . $order->id . ')订单已关闭,无法付款');
+            }
+            if ($order->is_pending) {
+                throw new AppException('(ID:' . $order->id . ')订单已锁定,无法付款');
+            }
+
+            //找人代付  商米D2支付方式有冲突，加pos_pay请求
+            if ($order->uid != \YunShop::app()->getMemberId() && !Member::getPid() && !in_array($this->pay_type_id,[PayType::BACKEND,PayType::VIDEO_SHOP_PAY]) && !request()->pos_pay) {
+                throw new AppException('(ID:' . $order->id . ')该订单属于其他用户');
+            }
+            // 转账付款审核中
+            if ($order->pay_type_id == PayType::REMITTANCE) {
+                throw new AppException('(ID:' . $order->id . ')该订单处于转账审核中,请先关闭转账审核申请,再选择其他支付方式');
+            }
+
+            //验证订单里的商品是否已被删除
+            $order->orderGoods->each(function (OrderGoods $orderGoods) {
+
+                if (is_null($orderGoods->goods)) {
+                    throw new AppException('[ID:' . $orderGoods->order_id . ']订单商品:'.$orderGoods->title.'已删除，无法付款');
+                }
+
+                if ($orderGoods->goods_option_id && is_null($orderGoods->goodsOption)) {
+
+                    throw new AppException('[ID:' . $orderGoods->order_id . ']订单商品:'.$orderGoods->title.'-规格:'.$orderGoods->goods_option_title.'已删除，无法付款');
+                }
+
+            });
+
+            // 校验订单商品库存
+            event(new BeforeOrderPayValidateEvent($order,$this));
+        });
+        // 订单金额验证
+        if ($orders->sum('price') < 0) {
+            throw new AppException('(' . $this->orders->sum('price') . ')订单金额有误');
+        }
+    }
+
+    /**
+     * @throws AppException
+     */
+    public function store()
+    {
+        $this->save();
+        if ($this->id === null) {
+            throw new AppException('支付流水记录保存失败');
+
+        }
+        $this->orders()->attach($this->order_ids);
+        // 校验库存
+        foreach ($this->orders as $order) {
+            foreach ($order->orderGoods as $orderGoods) {
+                /**
+                 * @var OrderGoods $orderGoods
+                 */
+                $orderGoods->goodsStock()->withhold();
+            }
+        }
+
+    }
+}

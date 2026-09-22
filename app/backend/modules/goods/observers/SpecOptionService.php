@@ -1,0 +1,445 @@
+<?php
+/**
+ * Created by PhpStorm.
+ *
+ *
+ *
+ * Date: 2021/9/28
+ * Time: 16:04
+ */
+
+namespace app\backend\modules\goods\services;
+
+
+use app\backend\modules\goods\models\Goods;
+use app\backend\modules\goods\models\GoodsOption;
+use app\backend\modules\goods\models\GoodsSpec;
+use app\backend\modules\goods\models\GoodsSpecItem;
+use app\common\models\goods\GoodsOptionModel;
+use app\common\services\upload\UploadService;
+use app\Jobs\DispatchesJobs;
+use app\Jobs\ProductCadJob;
+use app\Jobs\UpdateModelJob;
+use app\Jobs\UploadModelJob;
+use Illuminate\Support\Facades\Http;
+use app\Jobs\PdfJob;
+use Symfony\Component\HttpFoundation\File\UploadedFile;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use Illuminate\Contracts\Bus\Dispatcher;
+class SpecOptionService
+{
+
+    protected static $instance = null;
+
+
+    protected $parameter;
+
+    protected $goods_id;
+
+    protected $uniacid;
+
+
+
+
+    public function __construct()
+    {
+
+    }
+
+    public static function storeV2($goods_id,$option, $uniacid)
+    {
+        foreach ($option['modelJson'] as $key=>$item){
+            self::store($goods_id,$item,$uniacid);
+        }
+    }
+
+
+    public static function store($goods_id,$option, $uniacid)
+    {
+
+        $self = self::getInstance();
+
+        $self->parameter = $option;
+        $self->goods_id = $goods_id;
+        $self->uniacid = $uniacid;
+        $goods_info = Goods::where('id',$self->goods_id)->first();
+        $stock = $goods_info->stock;
+
+        $supplier_id = $goods_info->supp_id;
+
+//        if (empty($option['specs']) || empty($option['option'])) {
+//            return;
+//        }
+
+        if (!$option['has_option'] && empty($option['specs'])) {
+            GoodsSpec::where('goods_id', '=', $goods_id)->delete();
+            GoodsOption::where('goods_id', '=', $goods_id)->delete();
+            return;
+        }
+
+
+        //规格项
+        $spec_items = $self->saveSpec();
+
+        //规格信息
+        $self->saveOption($spec_items,$stock,$supplier_id);
+    }
+
+    public function saveSpec()
+    {
+        $specs = $this->parameter['specs'];
+
+        $spec_items = [];
+        foreach ($specs as $specIndex => $spec) {
+            $spec_data = [
+                "uniacid" => $this->uniacid,
+                "goods_id" => $this->goods_id,
+                "display_order" => $specIndex,
+                "title" => $spec['title']
+            ];
+
+            //新添加规格
+            $tag = substr($spec['id'], 0, 2);
+            if ('SC' == strtoupper($tag)) {
+                $goods_spec = GoodsSpec::Create($spec_data);
+                $spec_id = $goods_spec->id;
+            } else {
+                $goods_spec = GoodsSpec::updateOrCreate(['id' => $spec['id']], $spec_data);
+                $spec_id = $goods_spec->id;
+            }
+
+            $itemids = [];
+            $this->processSpecItems($spec['spec_item'], $spec_id, $itemids, $spec_items);
+            if (count($itemids) > 0) {
+                GoodsSpecItem::where('specid', '=', $spec_id)->whereNotIn('id', $itemids)->delete();
+            } else {
+                GoodsSpecItem::where('specid', '=', $spec_id)->delete();
+            }
+
+            GoodsSpec::updateOrCreate(['id' => $spec_id], ['content' => serialize($itemids)]);
+            $specids[] = $spec_id;
+
+        }
+
+        if (count($specids) > 0) {
+            GoodsSpec::where('goods_id', '=', $this->goods_id)->whereNotIn('id', $specids)->delete();
+        } else {
+            GoodsSpec::where('goods_id', '=', $this->goods_id)->delete();
+        }
+        return $spec_items;
+    }
+
+
+
+    /**
+     * 递归处理规格项
+     */
+    private function processSpecItems($items, $spec_id, &$itemids, &$spec_items, $parent_id = 0, $level = 1)
+    {
+        foreach ($items as $valueIndex => $value) {
+            $specItem = [
+                "uniacid" => $this->uniacid,
+                "specid" => $spec_id,
+                "parent_id" => $parent_id,
+                "level" => $level,
+                "display_order" => $valueIndex,
+                "title" => $value['title'],
+                "show" => $value['show'] ?: 1,
+                "thumb" => $value['thumb'] ?? '',
+                "virtual" => $value['virtual'] ?? 0,
+                "productType"=>$level == 1?$value['productType']:null,
+            ];
+
+            // 处理规格项
+            $valueTag = substr($value['id'], 0, 2);
+            if ('SV' == strtoupper($valueTag) || strpos($value['id'], "CH") !== false) {
+                $goods_spec_item = GoodsSpecItem::create($specItem);
+                $item_id = $goods_spec_item->id;
+            }else {
+                $goods_spec_item = GoodsSpecItem::updateOrCreate(['id' => $value['id']], $specItem);
+                $item_id = $goods_spec_item->id;
+            }
+
+            $itemids[] = $item_id;
+            $spec_items[$value['id']] = ['item_id' => $item_id, 'title' => $specItem['title']];
+
+            // 处理子规格
+            if (!empty($value['children']) && $level < 3) {
+                $this->processSpecItems($value['children'], $spec_id, $itemids, $spec_items, $item_id, $level + 1);
+            }
+        }
+    }
+
+    public function saveOption($spec_items,$stock,$supplier_id)
+    {
+
+        $optionPost =   $specs = $this->parameter['option'];
+        $option_stock = $stock;
+        $optionids = [];
+        $originalCadModels = []; // 存储更新前的cad_plan_model值
+        $cadPlanModels = []; // 存储新的cad_plan_model值
+        $originalOptions = GoodsOption::where('goods_id', $this->goods_id)
+            ->pluck('cad_plan_model', 'id')
+            ->toArray();
+
+        // 新增：用于跟踪已经出现过的 spec_item_id
+        $processedSpecItems = [];
+
+        foreach ($optionPost as $oKey =>  $option) {
+            $optiondata = $option['modelTypes'];
+            foreach ($optiondata as $k => $item){
+                $modelType = $item['modelType'];
+                $option = $item['option'];
+                //规格项id处理
+                $spec_item_ids = explode('_',$option['specs']);
+                $specs_id_array = array_map(function ($spec_item_id) use ($spec_items) {
+                    return $spec_items[$spec_item_id]['item_id'];
+                },$spec_item_ids);
+                $option_title = array_map(function ($spec_item_id) use ($spec_items) {
+                    return $spec_items[$spec_item_id]['title'];
+                },$spec_item_ids);
+
+                // 判断是否是第一个出现的 spec_item_id
+                $currentSpecItemId = $specs_id_array[0];
+                $isFirstOccurrence = !in_array($currentSpecItemId, $processedSpecItems);
+
+                // 如果是第一次出现，添加到已处理列表
+                if ($isFirstOccurrence) {
+                    $processedSpecItems[] = $currentSpecItemId;
+                }
+                $image_names = [
+                    "d3max_original_name"=>$option['d3MaxName'],
+                    "cad_original_name"=>$option['cad_plan_modelName'],
+                    "white_original_name"=>$option['thumbName']
+                ];
+
+                $goodsOption = [
+                    "uniacid" => $this->uniacid,
+                    "goods_id" => $this->goods_id,
+                    "title" =>implode('+',$option_title),
+                    "product_price" => floatVal($option['product_price']),
+                    "cost_price" =>  floatVal($option['cost_price']),
+                    "market_price" => floatVal($option['product_price']),
+                    "stock" => $option_stock?:0,
+                    "weight" => floatVal($option['weight']),
+                    "volume" => floatVal($option['volume']),
+//                    "goods_sn" => $option['goods_sn'],
+//                    "product_sn" => $option['product_sn'],
+                    "product_model"=>$option['product_model'],
+                    //新增
+                    'length' => $option['length'],
+                    'width' => $option['width'],
+                    'height' => $option['height'],
+                    'package_number' => $option['package_number'],
+                    'package_option' => serialize($option['package_option']),
+                    'thumb' => $option['thumb'],
+                    'd3model'=> $option['d3model'],
+                    'cad_plan_model' => $option['cad_plan_model'],
+                    "specs" => implode('_',$specs_id_array),
+                    "spec_item_id"=>$specs_id_array[0],
+                    "is_default" => $isFirstOccurrence ? 1 : 0, // 修改这里：只有第一次出现才设置为1
+                    'virtual' => 0,
+                    'modelType'=>$modelType,
+                    'singleType'=>$option['singleType']?:0,
+                    "red_price" => '',
+                    'd3MaxUrl'=>$option['d3MaxUrl'],
+                    'structure'=>$option['structure'],
+                    "display_order" => $k,
+                    "model_param"=>serialize($option['model_param']?:[]),
+                    'thumb_url'=>(!empty($option['thumb_url']) && $option['thumb_url'] != 'null')?serialize($option['thumb_url']):serialize([]),
+                    'supp_id'=>$supplier_id,
+                    "image_names"=>serialize($image_names)
+                ];
+
+                if($option['d3ModelUrl_weld']){
+                    $goodsOption['d3ModelUrl_weld'] = $option['d3ModelUrl_weld'];
+                }
+
+                if($option['d3ModelUrl_ori']){
+                    $goodsOption['d3ModelUrl_ori'] = $option['d3ModelUrl_ori'];
+                }
+
+                $optionTag = substr($option['id'], 0, 2);
+                if ('SP' == strtoupper($optionTag)) {
+                    $goodsOptionModel = GoodsOption::create($goodsOption);
+                    $option_id = $goodsOptionModel->id;
+                    $originalCadModels[$option_id] = 1;
+                } else {
+                    $originalCadModels[$option['id']] = $originalOptions[$option['id']] ?? null;
+                    $goodsOptionModel = GoodsOption::updateOrCreate(['id' => $option['id']], $goodsOption);
+                    $option_id = $goodsOptionModel->id;
+                }
+
+                $bufferKey = "widgets.option.option.{$oKey}.modelTypes.{$k}.option.d3ModelUrl_buffer";
+                if (request()->hasFile($bufferKey)) {
+
+                    $file = request()->file($bufferKey);
+
+                    // 获取文件扩展名（如果为空，则默认设为 .glb）
+                    $extension = $file->getClientOriginalExtension() ?: 'glb';
+
+                    // 生成唯一文件名（时间戳 + 随机字符串）
+                    $fileName = time() . '_' . Str::random(10) . '.' . $extension;
+
+                    $filePath = $file->storeAs('uploads/models', $fileName, 'public');
+                    $fullPath = storage_path("app/public/{$filePath}");
+
+                    // 上传到 OSS
+                    $job = new UploadModelJob($option_id,$this->uniacid,$fullPath,$fileName,1);
+                    app(Dispatcher::class)->dispatch($job);
+
+                }
+
+                $d3ModelUrlKey = "widgets.option.option.{$oKey}.modelTypes.{$k}.option.d3ModelUrl_ori_file";
+                if (request()->hasFile($d3ModelUrlKey)) {
+
+                    $file = request()->file($d3ModelUrlKey);
+                    // 获取文件扩展名（如果为空，则默认设为 .glb）
+                    $extension = $file->getClientOriginalExtension() ?: 'glb';
+
+                    // 生成唯一文件名（时间戳 + 随机字符串）
+                    $fileName = time() . '_' . Str::random(10) . '.' . $extension;
+
+                    $filePath = $file->storeAs('uploads/models', $fileName, 'public');
+                    $fullPath = storage_path("app/public/{$filePath}");
+
+                    // 上传到 OSS 的队列任务
+                    $job = new UploadModelJob($option_id, $this->uniacid, $fullPath, $fileName,2);
+                    app(Dispatcher::class)->dispatch($job);
+
+                }
+                // 将option_id和对应的cad_plan_model存入数组
+                $cadPlanModels[$option_id] = $option['cad_plan_model'];
+
+                if($option['model_param']){
+                    $this->updateModel($option['model_param'],$option_id);
+                    //更改异步
+
+                }
+
+                $optionids[] = $option_id;
+            }
+
+        }
+        //异步更新cad文件
+        $job = new ProductCadJob($this->goods_id,$optionids,$originalCadModels,$cadPlanModels,$this->uniacid);
+        DispatchesJobs::dispatch($job,DispatchesJobs::LOW);
+
+       /* $job = new PdfJob($this->goods_id,$this->uniacid);
+        DispatchesJobs::dispatch($job,DispatchesJobs::LOW);*/
+        if (count($optionids) > 0) {
+            GoodsOption::where('goods_id', '=', $this->goods_id)->whereNotIn('id', $optionids)->delete();
+        } else {
+            GoodsOption::where('goods_id', '=', $this->goods_id)->delete();
+        }
+
+        $goodsMeiliSearch = new GoodsMeiliSearchService();
+        $goodsMeiliSearch->reindexByGoodsId($this->goods_id);
+
+    }
+
+
+
+    private function uploadOssTwo($save_path, $file_name)
+    {
+
+        $uploadedFile = new UploadedFile(
+            $save_path,
+            $file_name,
+            mime_content_type($save_path),
+            null,
+            true // Mark as test file to avoid further validation
+        );
+
+        $uploadService = new UploadService();
+        $upload_res = $uploadService->upload($uploadedFile, "file", "files");
+
+        $relative_path = $upload_res['relative_path'];
+        return $relative_path;
+    }
+
+
+    private function uploadOss($file)
+    {
+
+        $uploadService = new UploadService();
+        $upload_res = $uploadService->upload($file, "file", "files");
+
+        $relative_path = $upload_res['relative_path'];
+        return $relative_path;
+    }
+
+
+    private static function updateModel($model_param, $option_id)
+    {
+        $ids = collect($model_param)->pluck('id')->filter()->toArray(); // 获取有效的 ID 列表
+        $existingModels = GoodsOptionModel::whereIn('id', $ids)->get()->keyBy('id'); // 一次性查询所有数据
+
+        // 删除不在新数据中的旧数据
+        if (!empty($ids)) {
+            GoodsOptionModel::where('option_id',$option_id)->whereNotin('id',$ids)->delete();
+        }else{
+            GoodsOptionModel::where('option_id',$option_id)->delete();
+        }
+
+        $insert_data = [];
+        $update_data = [];
+
+        $timestamp = time();
+
+        foreach ($model_param as $key=> $item) {
+            $id = $item['id'] ?: 0;
+            $data = [
+                "name"         => $item['name'],
+                "originName"   => $item['originName'],
+                "option_id"    => $option_id,
+                'sort'         => $item['index'],
+                "changeLock"   => $item['changeLock'] ? 1 : 0,
+                "default_color"=> serialize($item['default_color'] ?: []),
+                "select_color" => serialize($item['select_color'] ?: []),
+                "map_param"    => serialize($item['map_param'] ?: []),
+                "meshs_name"   => serialize($item['meshs_name'] ?: []),
+                "visible"      => $item['visible'] ? 1 : 0,
+                "updated_at"   => $timestamp,
+            ];
+
+            if ($id && isset($existingModels[$id])) {
+                // 需要更新的记录
+                $update_data[$id] = $data;
+            } else {
+                // 需要插入的记录
+                $data["created_at"] = $timestamp;
+                $insert_data[] = $data;
+            }
+        }
+
+        // 批量更新
+        foreach ($update_data as $id => $data) {
+            GoodsOptionModel::where('id', $id)->update($data);
+        }
+
+        // 批量插入
+        if (!empty($insert_data)) {
+            GoodsOptionModel::insert($insert_data);
+        }
+    }
+
+
+
+
+
+    /**
+     * 单例缓存
+     * @return null|self
+     */
+    public static function getInstance()
+    {
+        if (!isset(self::$instance)) {
+            self::$instance =  new self();
+
+        }
+        return self::$instance;
+
+    }
+}

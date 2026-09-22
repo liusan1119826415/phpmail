@@ -1,0 +1,13 @@
+schema_version: 1
+module_path: app_framework
+title: 应用核心框架与全局基础设施
+scope:
+    - app/Kernel.php
+    - app/Upload.php
+    - app/helpers.php
+    - app/laravel.php
+    - app/yunshop.php
+source_files: []
+depends_on: []
+related_to:
+    - path: business_features

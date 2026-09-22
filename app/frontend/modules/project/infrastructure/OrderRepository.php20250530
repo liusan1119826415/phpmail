@@ -1,0 +1,1211 @@
+<?php
+
+namespace app\frontend\modules\project\infrastructure;
+
+use app\backend\modules\charts\models\Supplier;
+use app\common\exceptions\AppException;
+
+use app\common\exceptions\ShopException;
+use app\common\models\Address;
+use app\common\models\goods\ReturnAddress;
+use app\common\models\kefu\ServiceUser;
+use app\common\models\OrderAddress;
+use app\common\models\PayType;
+use app\common\models\project\InstallOrder;
+use app\common\models\project\InstallTracks;
+use app\common\models\project\LogisticsTracks;
+use app\common\models\project\OrderStage;
+use app\common\modules\payType\remittance\models\flows\RemittanceAuditFlow;
+use app\common\modules\payType\remittance\models\process\RemittanceAuditProcess;
+use app\frontend\models\Member;
+use app\frontend\models\OrderGoods;
+use app\frontend\modules\memberCart\MemberCartCollection;
+use app\frontend\modules\project\models\Project;
+use app\frontend\modules\project\repositories\OrderRepositoryInterface;
+use app\common\models\Order;
+use app\frontend\repositories\MemberAddressRepository;
+use Illuminate\Support\Facades\Cache;
+use Yunshop\Supplier\common\models\SupplierInstallPrice;
+use Yunshop\Supplier\common\models\SupplierLogisticPrice;
+use Illuminate\Support\Facades\Redis;
+class OrderRepository extends BaseRepository implements OrderRepositoryInterface
+{
+
+
+    public function preOrder(int $project_id)
+    {
+        $project = Project::find($project_id);
+        if ($project->order_status == 1) {
+            throw new AppException('订单已经生成');
+        }
+        $trade = $this->getMemberCarts($project_id)->getTrade(Member::current());
+        $trade->total_num = app('OrderManager')->make('MemberCart')->where('project_id', $project_id)->sum('total');
+        return $trade;
+    }
+
+
+    public function createOrder(int $project_id)
+    {
+        $project = Project::find($project_id);
+        if ($project->order_status == 1) {
+            throw new AppException('订单已经生成');
+        }
+        $trade = $this->getMemberCarts($project_id)->getTrade(Member::current());
+        $orderId = $trade->generate();
+
+        //生成订单,触发事件
+        //已下单更改订单状态
+
+        $project->order_status = 1; //更改为已下单状态
+        $project->save();
+        $member_id = \YunShop::app()->getMemberId();
+        Redis::del("user:{$member_id}:active_project_1");
+        //app(MemberAddressRepository::class)->modelInstance()->where('uid', \YunShop::app()->getMemberId())->delete();
+        return ['order_ids' => $orderId];
+    }
+
+
+    public function getList(array $search): array
+    {
+        $member_id = \YunShop::app()->getMemberId();
+        $query = app('OrderManager')->make('Order')->uniacid()->select("*")->with(['project' => function ($query) {
+            $query->select("id", "name");
+        }, 'supplier' => function ($query) {
+            $query->select("id", "store_name");
+        }, 'hasOneRefundApply' => function ($query) {
+            $query->select("id", "refund_sn", "price", "status", "apply_price", "reason", "content", "refund_time", "created_at");
+        }])->where('uid', $member_id)->where('order_type', 1)->where('parent_id',0);
+        if ($search['is_member_deleted']) {
+            $query->where('is_member_deleted', $search['is_member_deleted']);
+        } else {
+            $query->where('is_member_deleted', 0);
+        }
+        $search['start_date'] = $search['start_date'] ? strtotime($search['start_date']) : "";
+        $search['end_date'] = $search['end_date'] ? strtotime($search['end_date']) : "";
+        // 按创建时间范围搜索
+        if (!empty($search['start_date']) && !empty($search['end_date'])) {
+            $query->whereBetween('create_time', [$search['start_date'], $search['end_date']]);
+        } elseif (!empty($search['start_date'])) {
+            $query->where('create_time', '>=', $search['start_date']);
+        } elseif (!empty($search['end_date'])) {
+            $query->where('create_time', '<=', $search['end_date']);
+        }
+
+        if ($search['name']) {
+            $query->whereHas('project', function ($query) use ($search) {
+                $query->where('name', 'like', '%' . $search['name'] . '%');
+            });
+        }
+
+        if (isset($search['status']) && ($search['status'] !== '' || $search['status'] === 0)) {
+
+            if ($search['status'] !== "all" && $search['status'] != 2) {
+                if($search['status'] == 0){
+                    $query->where(function ($q) {
+                        $q->where(function ($q1) {
+                            $q1->where('status', 0)->where('orderStatus', 0); // 待付收款
+                        })->orWhere(function ($q2) {
+                            $q2->where('status', 1)->where('orderStatus', 2); // 待付尾款
+                        });
+                    });
+                }elseif($search['status'] == 1){
+                    $query->where('status',1)->where('orderStatus',3);
+                }elseif($search['status'] == 4){
+                    $query->where('status',1)->where('orderStatus',1);
+                }elseif($search['status'] == 2){
+                    $query->where('status',2)->where('orderStatus',3);
+                }elseif($search['status'] == -1){
+                    $query->where('status',-1);
+                }
+
+            } elseif ($search['status'] == 5) {
+                //退款订单
+                $query->where('refund_id', '!=', 0);
+            }
+        }
+        $data = $query->orderBy('create_time','desc')->paginate(10);
+        return $data->toArray();
+
+    }
+
+
+    public function getAfterSalesOrder(array $search): array
+    {
+        $member_id = \YunShop::app()->getMemberId();
+        $query = app('OrderManager')->make('Order')->uniacid()->select("*")->with(['project' => function ($query) {
+            $query->select("id", "name");
+        }, 'hasOneRefundApply' => function ($query) {
+            $query->select("id", "refund_sn", "price", "status", "apply_price", "reason", "content", "refund_time", "created_at");
+        }])->where('uid', $member_id)->where('order_type', 1)->where('parent_id',0);
+
+        $query->where('is_member_deleted', 0)->where('refund_status','!=',0);
+
+            if (isset($search['refund_status']) && ($search['refund_status'] !== '' || $search['refund_status'] === 0)) {
+
+                if ($search['refund_status'] !== "all") {
+                    $query->where('refund_status', $search['refund_status']);
+                }
+            }
+
+
+        if ($search['name']) {
+            $query->whereHas('project', function ($query) use ($search) {
+                $query->where('name', 'like', '%' . $search['name'] . '%');
+            });
+        }
+
+
+
+        $data = $query->orderBy('create_time', 'desc')->paginate(10)->toArray();
+
+        // 转换 created_at 时间格式
+        foreach ($data['data'] as &$item) {
+            if (!empty($item['has_one_refund_apply']['created_at'])) {
+                $item['has_one_refund_apply']['created_at'] = date('Y-m-d H:i', $item['has_one_refund_apply']['created_at']);
+            }
+        }
+
+        return $data;
+    }
+
+    //确认图纸
+    public function confirmDraw(int $id): bool
+    {
+        try {
+            $order_goods = OrderGoods::where('id', $id)->first();
+            $order_goods->status = 1;
+            $order_goods->save();
+            $count = OrderGoods::where('order_id', $order_goods->order_id)->where('status', 0)->count();
+            if ($count == 0) {
+                $order = Order::find($order_goods->order_id);
+                Order::whereIn('parent_id',$order->parent_id)->update(['status'=>Order::WAIT_PAY]);
+                Order::where('id',$order->parent_id)->update(['status'=>Order::WAIT_PAY]);
+            }
+        } catch (\Exception $e) {
+            throw new AppException($e->getMessage());
+        }
+
+
+    }
+
+
+    public function getRecycleOrder(array $search): array
+    {
+        $member_id = \YunShop::app()->getMemberId();
+        $query = app('OrderManager')->make('Order')->uniacid()->select("*")->with(['project' => function ($query) {
+            $query->select("id", "name");
+        }])->where('uid', $member_id)->where('parent_id',0);
+
+        $query->where('is_member_deleted', 1);
+
+        $search['start_date'] = $search['start_date'] ? strtotime($search['start_date']) : "";
+        $search['end_date'] = $search['end_date'] ? strtotime($search['end_date']) : "";
+        // 按创建时间范围搜索
+        if (!empty($search['start_date']) && !empty($search['end_date'])) {
+            $query->whereBetween('create_time', [$search['start_date'], $search['end_date']]);
+        } elseif (!empty($search['start_date'])) {
+            $query->where('create_time', '>=', $search['start_date']);
+        } elseif (!empty($search['end_date'])) {
+            $query->where('create_time', '<=', $search['end_date']);
+        }
+
+        if ($search['name']) {
+            $query->whereHas('project', function ($query) use ($search) {
+                $query->where('name', 'like', '%' . $search['name'] . '%');
+            });
+        }
+        if ($search['status'] == 1) {
+            $query->where('order_type', 1);
+        } elseif ($search['status'] == 2) {
+            $query->where('order_type', 5);
+        } elseif ($search['status'] == 3) {
+            $query->whereIn('order_type', [2, 3, 4]);
+        }
+
+
+        $data = $query->paginate(10);
+        return $data->toArray();
+
+    }
+
+
+    /**
+     * 从project_id 获取项目空间中商品
+     * @return MemberCartCollection
+     * @throws AppException
+     */
+    protected function getMemberCarts($project_id)
+    {
+        static $memberCarts;
+        if (!isset($memberCarts)) {
+            $memberCarts = app('OrderManager')->make('MemberCart')->where('project_id', $project_id)->get();
+
+            $memberCarts = new MemberCartCollection($memberCarts);
+            $memberCarts->loadRelations();
+        }
+
+        if ($memberCarts->isEmpty()) {
+            throw new AppException('项目没有产品，请前往产品库选择产品');
+        }
+        return $memberCarts;
+    }
+
+    public function detail(int $order_id): array
+    {
+
+        $data = app('OrderManager')->make('Order')->where('id', $order_id)
+            ->with(['myOrderAddress' => function ($query) {
+                $query->select("id", "order_main_id", "realname", "address", "mobile");
+            }, 'hasOneOrderPay', 'orderPayments'])->first();
+
+        if($data){
+
+            $orderPayments = $data->orderPayments->toArray();
+
+            $formattedOrderPayments = [];
+            $pay_amount = 0;
+            $advance_payment = 0;
+            $tail_payment = 0;
+            $payable_amount = 0;
+            foreach ($orderPayments as $payment) {
+                if($payment['status'] == 1){
+                    $pay_amount += $payment['price'];
+                }
+                if($payment['stage'] == 1){
+                    $advance_payment = $payment['price'];
+                }
+                if($payment['stage'] == 2){
+                    $tail_payment = $payment['price'];
+
+                }
+                if($payment['stage'] == $data->payment_stage){
+                    $payable_amount = $payment['price'];
+                }
+
+                $formattedOrderPayments[] = [
+                    "name" => $payment['stage'] == 1?"阶段一：预付款":"阶段二：尾款",
+                    "goods_num" => "",
+                    "price"=>$payment['price'],
+                    "type"=>$payment['stage'] == 1?2:3,
+                    "order_sn" => $data->order_sn,
+                    "status"=>$payment['status'],
+                    "pay_amount"=>$payment['price'],
+                    "discount"=>[],
+                    "status_name"=>$payment['status'] == 0?"待付款":"已完成",
+                    "button"=>"申请售后"
+                ];
+            }
+            $data->advance_payment = $advance_payment;
+            $data->tail_payment = $tail_payment;
+            $data->logictis_fee = $data->freight_price;
+            $data->install_fee = $data->install_price;
+
+            //获取自提点
+
+
+            //获取物流信息
+//            $supplier_logistic = SupplierLogisticPrice::with(['supplier'])->where('order_id',$data->id)->where('bidding_status',4)->first();
+//
+//            $supplier_install = SupplierInstallPrice::with(['supplier'])->where('order_id',$data->id)->where('bidding_status',4)->first();
+
+            $supplier_logistic_lock = SupplierLogisticPrice::with(['supplier'])->where('order_id',$data->id)->where('lock_status',1)->first();
+
+            $supplier_install_lock = SupplierInstallPrice::with(['supplier'])->where('order_id',$data->id)->where('lock_status',1)->first();
+            if($data->status >= 1 && $data->orderStatus == 3 && $data->choose_logistics == 1){
+              $logistic_status_name = "已支付";
+                $logistic_status = 1;
+                $pay_amount += $data->freight_price;
+
+            }else{
+              $logistic_status_name = "";
+                $logistic_status = 0;
+            }
+
+
+          //获取汇款支付状态
+           if($data->pay_type_id == 16 && $data->order_pay_id){
+               $order_pay_id = $data->order_pay_id;
+               $remittanceAuditFlow = RemittanceAuditFlow::first();
+               $processBuilder = RemittanceAuditProcess::where('flow_id', $remittanceAuditFlow->id)->whereHas('remittanceRecord',function ($query) use($order_pay_id){
+                   $query->where('order_pay_id',$order_pay_id);
+               })->first();
+
+               $data->process_status = 0;
+               if($processBuilder->state == "processing"){
+                $data->process_status = 0;
+               }elseif($processBuilder->state == "completed"){
+                   $data->process_status = 1;
+               }else{
+                   $data->process_status = 2;
+               }
+           }
+
+
+
+
+            if($data->status >= 1 && $data->orderStatus == 3 && $data->choose_install == 1){
+                $pay_amount += $data->install_price;
+                $install_status = 0;
+            }else{
+                $install_status = 1;
+            }
+
+
+            // 追加一些假数据
+            $fakeData = [
+                [
+                    "name" => "商品采购",
+                    "goods_num" => $data->goods_total,
+                    "price"=>$data->goods_price,
+                    "pay_amount"=>$pay_amount,
+                    "order_sn" => "",
+                    "type"=>1,
+                    "status"=>$data->new_status,
+                    "discount"=>[],
+                    "status_name"=>$data->status_name,
+                    "button"=>"商品清单"
+                ]
+            ];
+            if($data->payment_stage == 2){
+                if($data->orderStatus == 3 && $data->choose_logistics == 1){
+                    if($supplier_logistic_lock){
+                        $fakeData[] = [
+                            "name" => "物流运输",
+                            "logistic_unit"=>$supplier_logistic->store_name?:"",
+                            "phone" => $supplier_logistic->supplier->mobile,
+                            "price"=>$supplier_logistic->freight_price?:0,
+                            "pay_amount"=>$supplier_logistic->freight_price?:0,
+                            "order_sn" => "",
+                            "type"=>4,
+                            "status"=>$logistic_status,
+                            'wait_status'=>$supplier_logistic?1:0,
+                            "discount"=>[
+                                /*[
+                                    "name"=>"安装店铺优惠",
+                                    "value"=>100
+                                ]*/
+                            ],
+                            "status_name"=>$logistic_status_name,
+                            "button"=>"物流信息"
+                        ];
+                    }
+                }
+                if($data->orderStatus != 3){
+                    $fakeData[] = [
+                        "name" => "物流运输",
+                        "logistic_unit"=>$supplier_logistic->store_name?:"",
+                        "phone" => $supplier_logistic->supplier->mobile,
+                        "price"=>$supplier_logistic->freight_price?:0,
+                        "pay_amount"=>$supplier_logistic->freight_price?:0,
+                        "order_sn" => "",
+                        "type"=>4,
+                        "status"=>$logistic_status,
+                        'wait_status'=>$supplier_logistic?1:0,
+                        "discount"=>[
+                            /*[
+                                "name"=>"安装店铺优惠",
+                                "value"=>100
+                            ]*/
+                        ],
+                        "status_name"=>$logistic_status_name,
+                        "button"=>"物流信息"
+                    ];
+                }
+                if($data->orderStatus == 3 && $data->choose_install == 1){
+                    if($supplier_install){
+                        $fakeData[] = [
+                            "name" => "安装搬运",
+                            "logistic_unit"=>$supplier_install->store_name,
+                            "phone" => $supplier_install->supplier->mobile,
+                            "price"=>$supplier_install->freight_price?:0,
+                            "pay_amount"=>$supplier_install->freight_price?:0,
+                            "order_sn" => "",
+                            "type"=>5,
+                            "status"=>$install_status,
+                            'wait_status'=>$supplier_install?1:0,
+                            "discount"=>[
+
+                            ],
+                            "status_name"=>$logistic_status_name,
+                            "button"=>"安装信息"
+                        ];
+                    }
+                }
+
+              if($data->orderStatus != 3){
+                  $fakeData[] = [
+                      "name" => "安装搬运",
+                      "logistic_unit"=>$supplier_install->store_name,
+                      "phone" => $supplier_install->supplier->mobile,
+                      "price"=>$supplier_install->freight_price?:0,
+                      "pay_amount"=>$supplier_install->freight_price?:0,
+                      "order_sn" => "",
+                      "type"=>5,
+                      "status"=>$logistic_status,
+                      'wait_status'=>$supplier_install?1:0,
+                      "discount"=>[
+
+                      ],
+                      "status_name"=>$logistic_status_name,
+                      "button"=>"安装信息"
+                  ];
+              }
+
+            }
+
+            $formattedOrderPayments = array_merge($formattedOrderPayments, $fakeData);
+            $data->pay_amount = $pay_amount; //已经付款
+            $data->orderPayments = $formattedOrderPayments;
+            $data->payable_amount = $payable_amount;
+        }
+        //阶段
+
+        return $data->toArray();
+    }
+
+
+
+    public function delete(int $id): bool
+    {
+        try {
+            $order = Order::find($id);
+            if (!$order) {
+                throw new AppException("未找到订单");
+            }
+            // 真实删除（永久删除数据）
+            $order->delete();
+            return true;
+        } catch (\Exception $e) {
+            throw new AppException($e->getMessage());
+        }
+    }
+
+    public function recycle(int $id): bool
+    {
+        try {
+            $order = Order::find($id);
+            if (!$order) {
+                throw new AppException("未找到订单");
+            }
+            // 真实删除（永久删除数据）
+            $order->is_member_deleted = 0;
+            $order->save();
+            return true;
+        } catch (\Exception $e) {
+            throw new AppException($e->getMessage());
+        }
+    }
+
+    /*public function batchConfirm(array $ids):bool
+    {
+
+        try {
+            $order_id = OrderGoods::where('id',$ids[0])->value("order_id");
+            $order_main_id = Order::where('id',$order_id)->value("id");
+
+            OrderGoods::whereIn('id',$ids)->update(["confirm_status"=>2,'confirm_time'=>time()]);
+            //更改主订单状态
+            Order::where('id',$order_main_id)->update(['status'=>0]);
+            Order::where('parent_id',$order_main_id)->update(['status'=>0,'confirm_time'=>time(),'confirm_status'=>1]);
+            return true;
+        }catch (\Exception $e){
+            throw new ShopException($e->getMessage());
+        }
+
+
+    }*/
+
+    public function batchConfirm(array $ids): bool
+    {
+
+        if(!$ids){
+            throw new AppException("请选择商品");
+        }
+        try {
+            // 1. 获取本次更新涉及的子订单 IDs
+            $orderIds = OrderGoods::whereIn('id', $ids)
+                ->pluck('order_id')
+                ->unique()
+                ->toArray();
+
+            if (empty($orderIds)) {
+                return false;
+            }
+
+            // 2. 查询主订单 ID（假设所有子订单属于同一个主订单）
+            $parentId = Order::where('id', $orderIds[0])->value('parent_id');
+
+
+            $expectedCount = count($ids);
+            $actualCount = OrderGoods::whereIn('id', $ids)
+                ->where('confirm_status', 1)
+                ->count();
+
+            if ($actualCount !== $expectedCount) {
+                throw new ShopException('存在未上传图纸的订单商品');
+            }
+
+            // 3. 更新本次商品为已确认
+            OrderGoods::whereIn('id', $ids)->where('confirm_status',1)->update([
+                'confirm_status' => 2,
+                'confirm_time' => time(),
+            ]);
+
+            // 4. 对每一个子订单，检查其是否所有商品都确认了，如果是，更新其状态
+            foreach ($orderIds as $orderId) {
+                $total = OrderGoods::where('order_id', $orderId)->count();
+                $confirmed = OrderGoods::where('order_id', $orderId)
+                    ->where('confirm_status', 2)
+                    ->count();
+
+                if ($total > 0 && $total == $confirmed) {
+                    Order::where('id', $orderId)->update([
+                        'status' => 0,
+                        'confirm_status' => 1,
+                        'confirm_time' => time(),
+                    ]);
+                }
+            }
+
+            // 5. 判断主订单下所有子订单是否都已确认（confirm_status = 1）
+            $childOrderIds = Order::where('parent_id', $parentId)->pluck('id')->toArray();
+
+            $childCount = count($childOrderIds);
+            $confirmedCount = Order::whereIn('id', $childOrderIds)
+                ->where('confirm_status', 1)
+                ->count();
+
+            if ($childCount > 0 && $childCount == $confirmedCount) {
+                Order::where('id', $parentId)->update([
+                    'status' => 0,
+                    'confirm_status' => 1,
+                    'confirm_time' => time(),
+                ]);
+            }
+
+            return true;
+        } catch (\Exception $e) {
+            throw new ShopException($e->getMessage());
+        }
+    }
+
+    //撤销确认图纸
+    public function cancelConfirm(int $order_goods_id): bool
+    {
+        try {
+            $orderGoods = OrderGoods::find($order_goods_id);
+
+            if (!$orderGoods) {
+                throw new ShopException("订单商品不存在");
+            }
+
+            if ($orderGoods->confirm_status !== 2) {
+                throw new ShopException("该订单商品未处于已确认状态，无法撤销");
+            }
+
+            // 撤销该商品确认状态
+            $orderGoods->confirm_status = 1;
+            $orderGoods->confirm_time = 0;
+            $orderGoods->save();
+
+            $orderId = $orderGoods->order_id;
+
+            // 撤销该订单的状态为
+
+                Order::where('id', $orderId)->update([
+                    'confirm_status' => 0,
+                    'confirm_time' => 0,
+                ]);
+
+
+            // 获取主订单 ID
+            $parentId = Order::where('id', $orderId)->value('parent_id');
+
+            if ($parentId) {
+                // 主订单撤销确认
+                    Order::where('id', $parentId)->update([
+                        'confirm_status' => 0,
+                        'confirm_time' => null,
+                    ]);
+
+            }
+
+            return true;
+
+        } catch (\Exception $e) {
+            throw new ShopException($e->getMessage());
+        }
+    }
+
+
+
+
+    //查看生产进度
+    public function getProductSchedule(int $project_id): array
+    {
+        $orderGoods = OrderGoods::select("id", "order_id", "title", "goods_option_title", "product_sn", "goods_id", "thumb", "total","components")
+            ->where('project_id', $project_id)
+            ->with(['hasOneGoods' => function ($query) {
+                $query->select("id", "lead_time", "supp_id")
+                    ->with(['supplierGoods' => function ($query) {
+                        $query->select("id", "store_name");
+                    }]);
+            }])
+            ->get();
+
+        // 重构数据结构
+        $groupedData = $orderGoods->groupBy(fn($item) => $item->hasOneGoods->supplierGoods->id ?? 0)
+            ->map(function ($items, $supp_id) {
+
+                $max_lead_time = $items->max(fn($item) => $item->hasOneGoods->lead_time ?? 0);
+
+                // 计算预计发货日期
+                $pay_time = optional($items->first()->order)->first_pay_time;
+                $ship_date = $pay_time ? date('Y-m-d', strtotime($pay_time . " +{$max_lead_time} days")) : null;
+
+                // 计算剩余天数
+                $remaining_days = $ship_date ? max(0, ceil((strtotime($ship_date) - time()) / 86400)) : null;
+
+
+                return [
+                    'id' => $supp_id,
+                    'store_name' => $items->first()->hasOneGoods->supplierGoods->store_name ?? '',
+                    'service_link' => ServiceUser::getDistributeService($supp_id),
+                    'estimated_ship_date' => $ship_date,  // 预计发货时间
+                    'remaining_days' => $remaining_days,  // 剩余天数
+                    'material_color'=>$this->getMaterialColor($items->toArray()),
+                    'data' => $items->toArray(),
+
+                ];
+            })
+            ->values()
+            ->toArray();
+
+        return $groupedData;
+    }
+
+
+
+    public function getDrawList(array $search): array
+    {
+
+        $memberId = \YunShop::app()->getMemberId();
+        $query = app('CartContainer')->make('MemberCart')->floor()
+            ->where(app('CartContainer')->make('MemberCart')->getTable() . '.member_id', $memberId);
+        $query->where(app('CartContainer')->make('MemberCart')->getTable() . '.project_id',$search['project_id']);
+        if ($search['floor_id']) {
+            $query = $query->where(app('CartContainer')->make('MemberCart')->getTable() . '.floor_id', $search['floor_id']);
+        }
+
+        if ($search['upload_status']) {
+            $query = $query->where(app('CartContainer')->make('MemberCart')->getTable() . '.upload_status', $search['upload_status']);
+        }
+
+
+
+        $data = $query->orderBy(app('CartContainer')->make('MemberCart')->getTable() . '.created_at', 'desc')
+            ->get()->toArray();
+
+
+        $result = collect($data)->groupBy('belongs_to_floor.id')->map(function ($floorItems, $floorId) {
+            $floorName = $floorItems->first()['belongs_to_floor']['floor_name'];
+
+            // 按空间分组
+            $spaces = collect($floorItems)->groupBy('belongs_to_space.id')->map(function ($spaceItems, $spaceId) {
+                $spaceName = $spaceItems->first()['belongs_to_space']['space_name'];
+
+                $goodsData = $spaceItems->map(function ($item) {
+                    return [
+                        "id"=>$item['id'],
+                        'goods_id' => $item['goods']['id'],
+                        'title' => $item['goods']['title'],
+                        'upload_status' => $item['upload_status'],
+                        "upload_time" => !empty($item['upload_time']) ? date("Y-m-d H:i:s", $item['upload_time']) : "",
+                        "confirm_time" => !empty($item['confirm_time']) ? date("Y-m-d H:i:s", $item['confirm_time']) : "",
+                        "total" => $item['total'],
+                        "customer_url" => "https://kefu.abangmi.com/im/kefu/index/index",
+                        "store_name" => $item['goods']['supplierGoods']['store_name'],
+                        "thumb" => yz_tomedia($item['goods_option']['thumb']),
+                        "product_price" => $item['goods_option']['product_price'],
+                        "unit_price" => $item['goods_option']['market_price'],
+                        "total_price" => $item['total'] * $item['goods_option']['market_price'],
+                        "status" => $this->getGoodsStatus($item),
+                        "sku" => $item['goods']['sku'],
+                        "type" => $item['type'],
+                        "length" => $item['goods_option']['length'],
+                        "width" => $item['goods_option']['width'],
+                        "height" => $item['goods_option']['height'],
+                        "product_model" => $item['goods_option']['product_model'],
+                        "material_color" => $this->getMaterialColor($item),
+                        "structure" => $item['goods']['structure'],
+                        "volume" => $item['goods_option']['volume'],
+                        "jsonData" => !empty($item['jsonData']) ? json_decode($item['jsonData'], true) : [],
+                        "modelData" => !empty($item['modelData']) ? json_decode($item['modelData'], true) : [],
+
+                    ];
+                })->values();
+                $spaceTotalPrice = $goodsData->sum('total_price');
+                $spaceTotalNum = $goodsData->sum('total');
+                return [
+                    'space_id' => $spaceId,
+                    'space_name' => $spaceName,
+                    'goods' => $goodsData,
+                    'space_total_price' => $spaceTotalPrice,
+                    'space_total_num' => $spaceTotalNum,
+                ];
+            })->values();
+            $floorTotalPrice = $spaces->sum('space_total_price');
+            $floorTotalNum = $spaces->sum('space_total_num');
+            return [
+                'floor_id' => $floorId,
+                'floor_name' => $floorName,
+                'space' => $spaces,
+                'floor_total_price' => $floorTotalPrice,
+                'floor_total_num' => $floorTotalNum,
+
+            ];
+        })->values();
+        $projectTotalPrice = $result->sum('floor_total_price');
+        $projectTotalNum = $result->sum('floor_total_num');
+        return [
+            'project_total_price' => $projectTotalPrice,
+            'project_total_num' => $projectTotalNum,
+            'data' => $result->toArray()
+        ];
+    }
+
+
+
+    public function getOrderGoods(array $search):array
+    {
+        $member_id = \YunShop::app()->getMemberId();
+        $cacheKey = "order_goods_list_{$member_id}_{$search['order_id']}";
+//        $data = Cache::get($cacheKey);
+//        if($data){
+//            return $data;
+//        }
+        $data = $this->getGoods($search);
+
+       // Cache::put($cacheKey, $data, 24 * 60 + rand(10, 99));  // 写入新缓存
+        return $data;
+
+    }
+
+
+
+
+
+    protected function getGoods(array $search): array
+    {
+
+        $query = \app\common\models\OrderGoods::with(['floors:id,name', 'spaces:id,name','order'=>function($query){
+            $query->select("id","order_sn","supp_id")->with(['supplier'=>function($query){
+                $query->select("id","store_name");
+            }]);
+        }])->where('refund_success',0);
+        if($search['order_id']){
+            $query->where('order_id', $search['order_id']);
+        }
+        if($search['project_id']){
+            $query->where('project_id', $search['project_id']);
+        }
+
+        if (isset($search['upload_status']) && ($search['upload_status'] !== '' || $search['upload_status'] === 0)) {
+
+                $query->where('upload_status', $search['upload_status']);
+
+        }
+
+        $OrderGoods = $query->get()
+            ->groupBy(fn($item) => $item->floors->name ?? '未分配楼层')
+            ->map(function ($floorGroup, $floorName){
+                return [
+                    'id' => $floorGroup->first()->floor_id ?? 0, // 取第一条数据的 floor_id
+                    'name' => $floorName,
+                    'data' => $floorGroup->groupBy(fn($item) => $item->spaces->name ?? '未分配空间')
+                        ->map(function ($spaceGroup, $spaceName){
+                            return [
+                                'id' => $spaceGroup->first()->space_id ?? 0, // 取第一条数据的 space_id
+                                'name' => $spaceName,
+                                'data' => $spaceGroup->map(function ($item){
+                                    // 给$item增加客服链接
+                                    $item->service_link =ServiceUser::getDistributeService($item->order->supp_id,$item->goods_id);
+                                    $item->store_name = $item->order->supplier->store_name;
+                                    $item->material_color = $this->getMaterialColor($item->toArray());
+                                    $item->draw_file= $item->draw_file?array_map(function($value) {
+                                        return yz_tomedia($value);
+                                    }, unserialize($item->draw_file)):[];
+                                    $item->upload_time = $item->upload_time?date("Y-m-d H:i:s",$item->upload_time):"";
+                                    $item->confirm_time = $item->confirm_time?date("Y-m-d H:i:s",$item->confirm_time):"";
+                                    return $item; // 返回完整的$item对象
+                                })->values()->all(),
+                            ];
+                        })->values()->all(),
+                ];
+            })->values()->all();
+
+        return $OrderGoods;
+    }
+
+
+
+
+    public function getAfterSalesOrderDetail(int $order_id):array
+    {
+
+       $order = Order::select("id","order_sn","project_id","goods_total","goods_price","create_time","pay_time")->with(['project'=>function($query){
+           $query->select("id","name","province_id","city_id","district_id","address_detail");
+       }])->where('id',$order_id)->first();
+
+       $orderIds = Order::where('parent_id',$order_id)->pluck("id")->toArray();
+       //获取子订单售后商品
+       $orderGoods = \app\common\models\OrderGoods::whereIn('order_id',$orderIds)->where('refund_id','>',0)->with(['order'=>function($query){
+           $query->select("id","order_sn","supp_id")->with(['supplier'=>function($query){
+               $query->select("id","store_name");
+           }]);
+       },'hasOneRefund'=>function($query){
+           $query->select("id","refund_sn","apply_price","price","refund_type","status","create_time");
+       }])->get();
+        $address = Address::whereIn('id',[$order->project->province_id,$order->project->city_id,$order->project->district_id])->pluck("areaname")->toArray();
+        $order->project->project_address_detail = $address[0].$address[1].$address[2].$order->project->address_detail;
+        $orderGoods = $orderGoods->map(function ($item) {
+            $item->material_color = $this->getMaterialColor($item->toArray());
+
+            $item->order->supplier->service_link = ServiceUser::getDistributeService($item->order->supplier->id,$item->goods_id);
+            return $item;
+        });
+
+
+
+        // 按供应商分组
+        $groupedOrderGoods = $orderGoods->groupBy(function ($item) {
+            return $item->order->supplier->id; // 以 supplier_id 作为分组键
+        })->map(function ($items, $supplierId) {
+
+            return [
+                'id'   => $supplierId,
+                'name' => $items->first()->order->supplier->store_name, // 获取分组的供应商名称
+                'service_link'=>ServiceUser::getDistributeService($supplierId),
+                "refund_sn"=>$items->first()->hasOneRefund->refund_sn,
+                'data' => $items->values(), // 返回对应的 orderGoods 数据
+            ];
+        })->values(); // 重新索引数组
+
+        $order->orderGoods = $groupedOrderGoods;
+        return $order->toArray();
+
+
+
+    }
+
+    public function getLogisticsTrack(int $order_id): array
+    {
+        $data = LogisticsTracks::getTracks($order_id);
+        $toarray = $data->toArray();
+        if(!is_array($toarray['track_logs'])){
+            $toarray['track_logs'] = json_decode($data->track_logs,true);
+        }
+        $info = SupplierLogisticPrice::where('order_id',$order_id)->where("bidding_status",4)->first();
+
+        if($info){
+            $toarray['customer_link'] = ServiceUser::getDistributeService($info->supplier_id);
+        }
+
+        return $toarray;
+    }
+
+    public function getInstallTrack(int $order_id): array
+    {
+        $data = InstallTracks::getTracks($order_id);
+        $toarray = $data->toArray();
+        if(!is_array($toarray['track_logs'])){
+            $toarray['track_logs'] = json_decode($data->track_logs,true);
+        }
+
+        $info = SupplierInstallPrice::where('order_id',$order_id)->where("bidding_status",4)->first();
+
+        if($info){
+            $toarray['customer_link'] = ServiceUser::getDistributeService($info->supplier_id);
+        }
+
+        return $toarray;
+    }
+
+
+    //获取汇款支付结果
+    public function getRemittanceResult($order_pay_id):array
+    {
+
+        $orderPay = \app\frontend\models\OrderPay::find($order_pay_id);
+        $order_first = $orderPay->orders->first();
+        $data = [];
+        if($orderPay->pay_type_id == 16){
+            $data = [
+
+                "remittance_data"=>[
+                    [   'title'=>'收款公司',
+                        'text'=>\Setting::get('shop.pay.remittance_bank_account_name')
+                    ],
+                    [   'title'=>'银行账号',
+                        'text'=>\Setting::get('shop.pay.remittance_bank_account')
+                    ],
+                    [   'title'=>'开户行',
+                        'text'=>\Setting::get('shop.pay.remittance_bank')
+                    ],
+                    [   'title'=>'行号',
+                        'text'=>\Setting::get('shop.pay.remittance_sub_bank')
+                    ],
+                ]
+
+            ];
+            $remittanceAuditFlow = RemittanceAuditFlow::first();
+
+            $processBuilder = RemittanceAuditProcess::where('flow_id', $remittanceAuditFlow->id)->whereHas('remittanceRecord',function ($query) use($order_pay_id){
+                $query->where('order_pay_id',$order_pay_id);
+            })->first();
+
+
+
+            $process_status = 0;
+            if($processBuilder->state == "processing"){
+                $process_status = 0;
+            }elseif($processBuilder->state == "completed"){
+                $process_status = 1;
+            }else{
+                $process_status = 2;
+            }
+            $data['status'] = $process_status;
+            $data['status_name'] = $processBuilder->status_name;
+        }else{
+            $data['status'] = $orderPay->status;
+            $data['status_name'] = $orderPay->status == 1?"支付成功":"等待支付结果";
+        }
+
+        $data['pay_type_name'] = $orderPay->pay_type_name;
+        $data['order_sn'] = $order_first->order_sn;
+        $data['pay_type'] = $orderPay->pay_type_id;
+        $data['pay_time'] = $orderPay->pay_time?$orderPay->pay_time->format('Y-m-d H:i:s'):"";
+      //  $orderStages = OrderStage::where('order_id',$order_first->id)->get();
+        /*$payAmount = 0;
+        foreach ($orderStages as $stage) {
+            if ($stage->stage == $orderPay->payment_stage) {
+                $payAmount = $stage->price;
+            }
+
+        }*/
+        $payAmount = $order_first->price;
+        $total_amount = 0;
+
+        if($order_first->order_type == 1){
+            $data['pay_data'][] =
+                [
+                    "name"=>  $orderPay->payment_stage == 1?"预付款金额":"尾款金额",
+                    "amount"=>$payAmount
+                ];
+
+            $total_amount += $payAmount;
+            if($orderPay->payment_stage == 2){
+                if($order_first->choose_logistics ==1){
+                    $data['pay_data'][] =
+                        [
+                            "name"=>  "物流运输费",
+                            "amount"=>$order_first->freight_price,
+                        ];
+                }
+
+                if($order_first->choose_install ==1){
+                    $data['pay_data'][] =
+                        [
+                            "name"=>  "安装搬运费",
+                            "amount"=>$order_first->install_price,
+                        ];
+                }
+
+                $logistic_price = $order_first->choose_logistics ==1?$order_first->freight_price:0;
+                $install_price = $order_first->choose_install ==1?$order_first->install_price:0;
+                $total_amount += $logistic_price+$install_price;
+
+            }
+
+            $data['pay_data'][] =
+                [
+                    "name"=>  "支付总额",
+                    "amount"=>$total_amount,
+                ];
+            $data['total_pay_amount'] = $total_amount;
+        }else{
+            $data['pay_data'] = [
+                [
+                    "name"=>  "支付总额",
+                    "amount"=>$order_first->price
+                ],
+            ];
+            $data['total_pay_amount'] = $order_first->price;
+        }
+
+
+        return $data;
+    }
+
+
+    //确认验收
+    public function confirmSign(int $order_main_id):bool
+    {
+        try {
+            $order = Order::find($order_main_id);
+            if(!$order){
+                throw new AppException("订单未找到");
+            }
+            $order->status = 3;
+            $order->finish_time = time();
+            $order->save();
+
+            //更新安装状态
+            InstallOrder::where('order_id',$order_main_id)->update(
+                [
+                    "install_status"=>2
+                ]
+            );
+            //更新子订单状态
+            Order::where('parent_id',$order_main_id)->update(
+                [
+                    "status"=>3,
+                    "finish_time"=>time()
+                ]
+            );
+
+            $data['current_status'] = 3;
+            $data['description'] = "已验收完毕。感谢您在帮米购物，欢迎再次光临。";
+            InstallTracks::updateInstallStatus($order_main_id,$data);
+
+            return true;
+        }catch (\Exception $e){
+            throw new AppException("确认验收失败");
+        }
+
+
+    }
+
+    public function getAddress(): array
+    {
+        $member_id = \YunShop::app()->getMemberId();
+
+        // 获取当前用户的所有主订单，包含对应 project_id
+        $orders = Order::where('uid', $member_id)
+            ->where('parent_id', 0)
+            ->where('order_type', 1)
+            ->select('id', 'project_id')
+            ->get();
+
+        // 提取订单 ID 和项目 ID
+        $orderIds = $orders->pluck('id')->toArray();
+        $projectMap = $orders->pluck('project_id', 'id'); // [order_id => project_id]
+
+        // 获取项目名称映射 [project_id => name]
+        $projectList = Project::whereIn('id', $projectMap->values()->unique())
+            ->pluck('name', 'id');
+
+        // 获取地址信息
+        $addressList = OrderAddress::whereIn('order_main_id', $orderIds)
+            ->select('order_main_id', 'address', 'mobile', 'realname', 'province_id', 'city_id', 'district_id')
+            ->get()
+            ->unique('address'); // address 字段去重
+
+        // 组装结果
+        $results = $addressList->map(function ($item) use ($projectMap, $projectList) {
+            $address_map = explode(" ", $item->address);
+            $projectId = $projectMap[$item->order_main_id] ?? null;
+            return [
+                'province' => $address_map[0] ?? '',
+                'city' => $address_map[1] ?? '',
+                'district' => $address_map[2] ?? '',
+                'address' => implode(" ", array_slice($address_map, 3)),
+                'phone' => $item->mobile,
+                'realname' => $item->realname,
+                'province_id' => $item->province_id,
+                'city_id' => $item->city_id,
+                'district_id' => $item->district_id,
+                'project_name' => $projectList[$projectId] ?? '',
+            ];
+        });
+
+        return $results->values()->toArray();
+    }
+
+
+
+    public function submitOrderSuccess(int $order_id):array
+    {
+        $order = Order::with(['project'=>function($query){
+            $query->select("id","name");
+        }])->find($order_id);
+        if(!$order){
+            throw new AppException("订单不存在");
+        }
+        //获取订单收货信息
+        $order_address = OrderAddress::where('order_main_id',$order->id)->first();
+        return [
+           'id'=>$order->id,
+           "order_sn"=>$order->order_sn,
+           "goods_total"=>$order->goods_total,
+           "goods_price"=> $order->goods_price,
+           "project_name"=>$order->project->name,
+            "address"=>$order_address->address,
+           "consignee"=>$order_address->realname." ".$order_address->mobile
+
+        ];
+    }
+
+    public function getPickupPoint(int $order_id):array
+    {
+        $data = Order::where('parent_id', $order_id)
+            ->with(['supplier' => function($query) {
+                $query->select('id', 'store_name', 'customer_phone', 'mobile');
+            }])
+            ->get();
+
+     // 获取订单数量
+        $count = $data->count();
+
+// 遍历处理数据
+        $result = $data->map(function ($order) {
+            $supplier = $order->supplier;
+
+            // 查询提货地址
+            $goodsReturnAddress = ReturnAddress::where('supplier_id', $supplier->id ?? 0)
+                ->where('is_refund', 2)
+                ->where('is_default', 1)
+                ->first();
+
+            $refund_address = $goodsReturnAddress
+                ? $goodsReturnAddress->province_name .
+                $goodsReturnAddress->city_name .
+                $goodsReturnAddress->district_name .
+                $goodsReturnAddress->street_name .
+                $goodsReturnAddress->address
+                : '';
+
+            return [
+                'total' => $order->total,
+                'goods_volume' => $order->goods_volume,
+                'refund_address' => $refund_address,
+                'contact_phone' => $supplier->customer_phone ?: $supplier->mobile,
+                'service_link'=>ServiceUser::getDistributeService($supplier->id),
+            ];
+        });
+
+// 返回处理后的结果和数量
+        return [
+            'count' => $count,
+            'point_data' => $result
+        ];
+
+
+
+
+    }
+
+
+
+
+}

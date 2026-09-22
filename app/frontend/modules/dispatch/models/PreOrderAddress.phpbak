@@ -1,0 +1,373 @@
+<?php
+/**
+ * Created by PhpStorm.
+ * User: shenyang
+ * Date: 2017/9/4
+ * Time: 下午5:00
+ */
+
+namespace app\frontend\modules\dispatch\models;
+
+
+use app\common\models\Address;
+use app\common\models\DispatchType;
+use app\frontend\models\OrderAddress;
+use app\frontend\modules\member\services\MemberService;
+use app\frontend\modules\order\models\PreOrder;
+use app\frontend\modules\project\models\Project;
+use app\frontend\repositories\MemberAddressRepository;
+use app\common\exceptions\AppException;
+use app\common\exceptions\ShopException;
+use app\common\models\Street;
+use Illuminate\Foundation\Validation\ValidatesRequests;
+
+class PreOrderAddress extends OrderAddress
+{
+
+	/**
+	 * @var PreOrder
+	 */
+	public $order;
+	private $memberAddress;
+
+	/**
+	 * @param PreOrder $order
+	 * @throws ShopException
+	 */
+	public function setOrder(PreOrder $order)
+	{
+		$this->order = $order;
+
+		$order->setRelation('orderAddress', $this);
+		$this->_init();
+	}
+
+
+	/**
+	 * @throws ShopException
+	 */
+	protected function _init()
+	{
+
+		//$this->fill($this->getOrderAddress()->toArray());
+        $orderAddress = $this->getOrderAddress();
+
+        // 先用 fill 填充已有字段
+        $this->fill($orderAddress->toArray());
+
+        // 手动添加 project_name 和 address_id
+        $this->setAttribute('project_name', $orderAddress->project_name);
+        $this->setAttribute('address_id', $orderAddress->address_id);
+        $this->setAttribute('address1', $orderAddress->address1);
+      /*  $this->setAttribute('province', $orderAddress->province);
+        $this->setAttribute('city', $orderAddress->city);
+        $this->setAttribute('district', $orderAddress->district);*/
+	}
+
+	public function validateAddress()
+	{
+		if (!$this->order->isNeedAddress()) {
+
+			if (empty(trim($this->address))) {
+				throw new AppException("收货地址不能为空",['address_error'=> 404]);
+			}
+
+			if ($this->isRegion()) {
+				$address = $this->getMemberAddress();
+				if (empty($this->province_id)) {
+					throw new AppException("收货地址有误,省份[{$address->province}]不存在",['address_error'=> 404]);
+				}
+				if (empty($this->city_id)) {
+					throw new AppException("收货地址有误,城市[{$address->city}]不存在",['address_error'=> 404]);
+				}
+				if (empty($this->district_id)) {
+					throw new AppException("收货地址有误,区县[{$address->district}]不存在",['address_error'=> 404]);
+				}
+			}
+
+            if ($this->isMustStreet()) {
+                if (empty($this->street_id)) {
+                    throw new AppException("收货地址有误,乡镇/街道地址必须选择",['address_error'=> 404]);
+                }
+            }
+		}
+	}
+
+	/**
+	 * @return OrderAddress
+	 * @throws ShopException
+	 */
+	protected function getOrderAddress()
+	{
+
+		if (!isset($this->memberAddress)) {
+			// $this->memberAddress = $this->_getMemberAddress();
+            //todo 这里修改为项目地址
+			//$this->memberAddress = $this->isRegion() ? $this->_getMemberAddress() : $this->_getAddress();
+            $this->memberAddress = $this->_getMemberAddressV2();
+
+            $this->setDeliveryTime();
+		}
+
+		return $this->memberAddress;
+	}
+
+	/**
+	 * @return bool true 需要；false 不
+	 */
+	protected function isRegion()
+	{
+		$is_region = \Setting::get('shop.trade.is_region');
+		return !$is_region;
+	}
+
+    /**
+     * 是否必须街道地址
+     * @return bool true 需要；false 不
+     */
+    protected function isMustStreet()
+    {
+        $set = \Setting::get('shop.trade');
+        return $set['is_street'] && $set['is_must_street'];
+    }
+
+    protected function setDeliveryTime()
+    {
+        if (\Setting::get('shop.trade.delivery_time')) {
+            $this->memberAddress->delivery_day = request()->delivery_day;
+            $this->memberAddress->delivery_time = request()->delivery_time;
+        }
+        return null;
+    }
+
+
+	/**
+	 * 不需要区域的下单地址
+	 */
+	private function _getAddress()
+	{
+
+		$member_address = $this->getMemberAddress();
+		$orderAddress = new OrderAddress();
+		$orderAddress->order_id = $this->order->id;
+		$orderAddress->mobile = $member_address->mobile;
+        if ($member_address->mobile && $member_address->country_code) {
+            MemberService::mobileValidate([
+                'mobile' => $member_address->mobile,
+                'state' => $member_address->country_code,
+            ]);
+        }
+		$orderAddress->realname = $member_address->username;
+		$province_id = $member_address->province_id ?: Address::where('areaname', $member_address->province)->where('level', 1)->value('id');
+		$city_id = $member_address->city_id ?: Address::where('areaname', $member_address->city)->where('parentid', $province_id)->value('id');
+		$district_id = $member_address->district_id ?: Address::where('areaname', $member_address->district)->where('parentid', $city_id)->value('id');
+		$orderAddress->province_id = $province_id ?: 0;
+		$orderAddress->city_id = $city_id ?: 0;
+		$orderAddress->district_id = $district_id ?: 0;
+		if (isset($member_address->street)) {
+			$orderAddress->street_id = Street::where('areaname', $member_address->street)->where('parentid', $orderAddress->district_id)->value('id') ?: 0;
+		}
+		$orderAddress->province = $member_address->province ?: '';
+		$orderAddress->city = $member_address->city ?: '';
+		$orderAddress->district = $member_address->district ?: '';
+		$orderAddress->street = $member_address->street ?: '';
+		$orderAddress->longitude = $member_address->longitude ?: '';
+		$orderAddress->latitude = $member_address->latitude ?: '';
+		$orderAddress->address = implode(' ', array_filter([$member_address->province, $member_address->city, $member_address->district, $orderAddress->street, $member_address->address]));
+        $orderAddress->country_code = $member_address->country_code ?: '';
+		return $orderAddress;
+	}
+
+
+    /**
+     * 获取项目配置地址
+     */
+    private function _getMemberAddressV2()
+    {
+
+        $member_address = $this->getProjectAddress();
+        $mAddress = app(MemberAddressRepository::class)->modelInstance()->where('uid',\YunShop::app()->getMemberId())->where('project_id',request()->input('project_id'))->where('isdefault',1)->first();
+
+        if($mAddress){
+            /*$mAddress->username = $member_address['realname'];
+            $mAddress->mobile = $member_address['phone'];
+            $mAddress->province = $member_address['province_id'];
+            $mAddress->city = $member_address['city_id'];
+            $mAddress->district = $member_address['district_id'];
+            $mAddress->address = $member_address['address'];
+            $mAddress->save();*/
+
+
+        }else{
+            $address_data = [
+             'uid'=>\YunShop::app()->getMemberId(),
+             'username' => $member_address['realname'],
+             'project_id'=> request()->input('project_id'),
+            'mobile' => $member_address['phone'],
+            'province' => $member_address['province_id'],
+            'city' => $member_address['city_id'],
+            'district' => $member_address['district_id'],
+            'address' => $member_address['address'],
+             'uniacid'=> \YunShop::app()->uniacid,
+            ];
+            $mAddress = app(MemberAddressRepository::class)->modelInstance();
+            $mAddress->setRawAttributes($address_data);
+            $validator = $mAddress->validator($mAddress->getAttributes());
+            $mAddress->save();
+        }
+        $orderAddress = new OrderAddress();
+
+        $orderAddress->order_id = $this->order->id;
+        if($mAddress){
+            $address = Address::whereIn('id',[$mAddress->province,$mAddress->city,$mAddress->district])->pluck('areaname')->toArray();
+            $orderAddress->mobile = $mAddress->mobile;
+            $orderAddress->province_id = $mAddress->province;
+            $orderAddress->city_id = $mAddress->city;
+            $orderAddress->district_id = $mAddress->district;
+            $orderAddress->address = implode(' ', [$address[0], $address[1], $address[2], $mAddress->address]);
+            $orderAddress->address1 = $mAddress->address;
+            $orderAddress->project_name = $member_address['project_name'];
+            $orderAddress->realname = $mAddress->username;
+            $orderAddress->province = $address[0];
+            $orderAddress->city = $address[1];
+            $orderAddress->district = $address[2];
+            $orderAddress->address_id = $mAddress->id;
+        }else{
+            $orderAddress->mobile = $member_address['phone'];
+            $orderAddress->province_id = $member_address['province_id'];
+            $orderAddress->city_id = $member_address['city_id'];
+            $orderAddress->district_id = $member_address['district_id'];
+            $orderAddress->address1 = $member_address['address'];
+            $orderAddress->address = implode(' ', [$member_address['province'], $member_address['city'], $member_address['district'], $member_address['address']]);
+            $orderAddress->project_name = $member_address['project_name'];
+            $orderAddress->realname = $member_address['realname'];
+            $orderAddress->province = $member_address['province'];
+            $orderAddress->city = $member_address['city'];
+            $orderAddress->district = $member_address['district'];
+            $orderAddress->address_id = $mAddress->id;
+        }
+
+        return $orderAddress;
+
+
+    }
+
+	/**
+	 * 获取用户配送地址模型
+	 * @return mixed
+	 * @throws AppException
+	 */
+	private function _getMemberAddress()
+	{
+		$member_address = $this->getMemberAddress();
+
+		$orderAddress = new OrderAddress();
+
+		$orderAddress->order_id = $this->order->id;
+		$orderAddress->mobile = $member_address->mobile;
+		if ($member_address->mobile && $member_address->country_code) {
+            MemberService::mobileValidate([
+                'mobile' => $member_address->mobile,
+                'state' => $member_address->country_code,
+            ]);
+        }
+		if ($member_address->province) {
+			$orderAddress->province_id = $member_address->province_id ?: Address::where('areaname', 'like', $member_address->province . '%')->where('level', 1)->value('id');
+		} else {
+			$orderAddress->province_id = $member_address->province_id ?: null;
+		}
+		$orderAddress->city_id = $member_address->city_id ?: Address::where('areaname', $member_address->city)->where('parentid', $orderAddress->province_id)->value('id');
+		$orderAddress->district_id = $member_address->district_id ?: Address::where('areaname', $member_address->district)->where('parentid', $orderAddress->city_id)->value('id');
+		$orderAddress->address = implode(' ', [$member_address->province, $member_address->city, $member_address->district, $member_address->address]);
+		//todo 修复前端传street等于空字符串时会报错
+		if (!empty($member_address->street) && $member_address->street != '其他') {
+			$orderAddress->street_id = Street::where('areaname', $member_address->street)->where('parentid', $orderAddress->district_id)->value('id');
+			if (!isset($orderAddress->street_id)) {
+				throw new AppException('收货地址有误请重新保存收货地址',['address_error'=> 404]);
+			}
+			$orderAddress->street = $member_address->street;
+			$orderAddress->address = implode(' ', [$member_address->province, $member_address->city, $member_address->district, $orderAddress->street, $member_address->address]);
+		}
+		$orderAddress->realname = $member_address->username;
+		$orderAddress->province = $member_address->province;
+		$orderAddress->city = $member_address->city;
+		$orderAddress->district = $member_address->district;
+		$orderAddress->longitude = $member_address->longitude ?: '';
+		$orderAddress->latitude = $member_address->latitude ?: '';
+		$orderAddress->country_code = $member_address->country_code ?: '';
+		return $orderAddress;
+	}
+
+
+	public function getProjectAddress()
+    {
+        $project_id = request()->input('project_id');
+        $project = Project::where('id',$project_id)->first();
+        $address = Address::whereIn('id',[$project->province_id,$project->city_id,$project->district_id])->pluck('areaname')->toArray();
+        return [
+          'project_name'=>$project->name,
+          "province"=>$address[0],
+          "city"=>$address[1],
+          "district"=>$address[2],
+          "address"=>$project->address_detail,
+          "realname"=>$project->contact_name,
+          "phone"=>$project->phone,
+          "province_id"=>$project->province_id,
+          "city_id"=>$project->city_id,
+          "district_id"=>$project->district_id,
+
+        ];
+
+    }
+
+	/**
+	 * 获取用户配送地址模型
+	 * @return mixed
+	 * @throws AppException
+	 */
+	public function getMemberAddress()
+	{
+		$address = json_decode(urldecode($this->order->getRequest()->input('address', '[]')), true);
+
+		if (count($address)) {
+			//$request->input('address');
+			$this->validate($address, [
+					'address' => 'required',
+					'mobile' => 'required',
+					'username' => 'required',
+					//province' => 'required',
+					//'city' => 'required',
+					// 'zipcode' => '',
+					//'district' => 'required'
+				]
+			);
+			$memberAddress = app(MemberAddressRepository::class)->fill($address);
+
+			return $memberAddress;
+		}
+
+		$defaultAddress = $this->order->belongsToMember->defaultAddress;
+//        if (empty($defaultAddress)) {
+//            $defaultAddress = app(MemberAddressRepository::class)->getStaticModel()->where('uid', $this->order->uid)->first();
+//        }
+
+		return $defaultAddress;
+	}
+
+	public function beforeSaving()
+	{
+		return parent::beforeSaving(); // TODO: Change the autogenerated stub
+	}
+
+	public function save(array $options = [])
+	{
+		if ($this->order->isNeedAddress()) {
+			\Log::info('---订单编号:' . $this->order->order_sn . '不需要地址----------');
+			return true;
+		}
+
+        $this->order_main_id = $this->order->parent_id;
+        unset($this->project_name, $this->address_id, $this->address1);
+		return parent::save($options); // TODO: Change the autogenerated stub
+	}
+}

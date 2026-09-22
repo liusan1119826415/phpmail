@@ -1,0 +1,81 @@
+<?php
+/**
+ * Created by PhpStorm.
+ * User: king/QQ:995265288
+ * Date: 2019-06-19
+ * Time: 16:52
+ */
+
+namespace app\backend\modules\excelRecharge\controllers;
+
+
+use app\common\components\BaseController;
+use Yunshop\Love\Common\Services\SetService;
+
+class PageController extends BaseController
+{
+    /**
+     * @var string
+     */
+    protected $path = 'app/public/recharge';
+
+
+    //批量充值页面接口
+    public function index()
+    {
+        if (request()->ajax()) {
+            $this->makeFilePath();
+            return $this->successJson('ok', $this->resultData());
+        }
+
+
+        return view('excelRecharge.page');
+    }
+
+    /**
+     * 创建目录
+     */
+    private function makeFilePath()
+    {
+        if (!is_dir(storage_path($this->path))) {
+            mkdir(storage_path($this->path), 0777);
+        }
+    }
+
+    private function resultData()
+    {
+        $data = [
+            ['name' => "积分", 'value' => "point"],
+            ['name' => "充值余额", 'value' => "balance"],
+        ];
+
+        if ($this->lovePluginStatus()) {
+            $data[] = ['name' => $this->loveName(), 'value' => "love"];
+        }
+
+        if (app('plugins')->isEnabled('integral')) {
+            $data[] = ['name' => $this->integralName(), 'value' => "integral"];
+        }
+
+        return $data;
+    }
+
+    private function loveName()
+    {
+        if ($this->lovePluginStatus()) {
+            return SetService::getLoveName();
+        }
+        return '爱心值';
+    }
+
+
+    private function integralName()
+    {
+        return \Yunshop\Integral\Common\Services\SetService::getIntegralName();
+    }
+
+    private function lovePluginStatus()
+    {
+        return app('plugins')->isEnabled('love');
+    }
+}

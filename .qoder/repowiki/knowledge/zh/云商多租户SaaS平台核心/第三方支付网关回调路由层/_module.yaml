@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: payment_gateways
+title: 第三方支付网关回调路由层
+scope:
+    - payment/
+source_files: []
+depends_on: []
+related_to: []

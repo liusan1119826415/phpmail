@@ -1,0 +1,709 @@
+<?php
+/**
+ * Created by PhpStorm.
+ * Author:
+ * Date: 24/03/2017
+ * Time: 01:07
+ */
+
+namespace app\payment\controllers;
+
+use app\backend\modules\refund\services\RefundOperationService;
+use app\common\events\finance\AlipayWithdrawEvent;
+use app\common\events\order\AfterOrderPaidRedirectEvent;
+use app\common\helpers\Url;
+use app\common\models\Order;
+use app\common\models\OrderPay;
+use app\common\models\PayOrder;
+use app\common\models\PayRefundOrder;
+use app\common\models\PayType;
+use app\common\models\PayWithdrawOrder;
+use app\common\models\refund\RefundApply;
+use app\common\modules\alipay\models\AlipayPayOrder;
+use app\common\services\alipay\f2fpay\model\AlipayConfig;
+use app\common\services\finance\Withdraw;
+use app\common\services\Pay;
+use app\payment\PaymentController;
+use app\common\models\OrderGoods;
+use Yunshop\StoreCashier\common\models\StoreOrder;
+use Illuminate\Support\Facades\Redis;
+
+class AlipayController extends PaymentController
+{
+    private $sign_type = ['MD5' => '支付宝', 'RSA' => '支付宝APP', 'RSA2' => '支付宝APP2.0'];
+
+    private $total_fee = ['MD5' => 'total_fee', 'RSA' => 'total_fee', 'RSA2' => 'total_amount'];
+
+    private $pay_type_id = 2;
+
+    //商城支付宝app支付异步通知
+    public function notifyUrl()
+    {
+        $this->log($_POST, '支付宝支付2.0');
+        $this->pay_type_id = 10;
+        $verify_result = $this->get_RSA_SignResult($_POST);
+        \Log::debug(sprintf('支付回调验证结果[%d]', intval($verify_result)));
+        if ($verify_result) {
+            if ($_POST['trade_status'] == 'TRADE_SUCCESS') {
+                if (strpos($_POST['out_trade_no'], '_') !== false) {
+                    $out_trade_no = substr($_POST['out_trade_no'], strpos($_POST['out_trade_no'], '_') + 1);
+                } else {
+                    $out_trade_no = $_POST['out_trade_no'];
+                }
+                $data = [
+                    'total_fee' => $_POST['total_amount'],
+                    'out_trade_no' => $out_trade_no,
+                    'trade_no' => $_POST['trade_no'],
+                    'unit' => 'yuan',
+                    'pay_type' => $this->sign_type[$_POST['sign_type']],
+                    'pay_type_id' => $this->pay_type_id
+
+                ];
+                $this->payResutl($data);
+            }
+
+            echo "success";
+        } else {
+            echo "fail";
+        }
+    }
+    //商城支付宝app支付异步通知
+    public function newNotifyUrl()
+    {
+        $this->log($_POST, '支付宝支付2.0');
+        $this->pay_type_id = 10;
+        $verify_result = $this->get_RSA_SignResult($_POST);
+        \Log::debug(sprintf('支付回调验证结果[%d]', intval($verify_result)));
+        if ($verify_result) {
+            if ($_POST['trade_status'] == 'TRADE_SUCCESS') {
+                if (strpos($_POST['out_trade_no'], '_') !== false) {
+                    $out_trade_no = substr($_POST['out_trade_no'], strpos($_POST['out_trade_no'], '_') + 1);
+                } else {
+                    $out_trade_no = $_POST['out_trade_no'];
+                }
+                $data = [
+                    'total_fee' => $_POST['total_amount'],
+                    'out_trade_no' => $out_trade_no,
+                    'trade_no' => $_POST['trade_no'],
+                    'unit' => 'yuan',
+                    'pay_type' => $this->sign_type[$_POST['sign_type']],
+                    'pay_type_id' => $this->pay_type_id
+
+                ];
+                $this->payResutl($data);
+            }
+
+            echo "success";
+        } else {
+            echo "fail";
+        }
+    }
+    //标准支付宝支付
+    public function preNotifyUrl()
+    {
+        $this->log($_POST, '支付宝支付2.0');
+        $verify_result = $this->get_RSA2_SignResult($_POST);
+        \Log::debug(sprintf('支付回调验证结果[%d]', intval($verify_result)));
+        if ($verify_result) {
+            if ($_POST['trade_status'] == 'TRADE_SUCCESS') {
+
+                if (strpos($_POST['out_trade_no'], '_') !== false) {
+                    $out_trade_no = substr($_POST['out_trade_no'], strpos($_POST['out_trade_no'], '_') + 1);
+                } else {
+                    $out_trade_no = $_POST['out_trade_no'];
+                }
+                $pay_order_model = PayOrder::where('out_order_no',$out_trade_no)->where('trade_no',$_POST['trade_no'])->where('status',2)->first();
+                if($pay_order_model){
+                    \Log::debug('订单支付宝已支付（数据库校验）',['out_order_no'=>$out_trade_no,'trade_no'=>$_POST['trade_no']]);
+                    echo "success";
+                    return;
+                }
+
+                $redisKey = "pay:callback:" . $_POST['trade_no'];
+                if (!$this->checkDuplicateWithRedis($redisKey)) {
+                    \Log::debug('订单支付宝已处理（Redis防重）', ['trade_no' => $_POST['trade_no']]);
+                    echo "success";
+                    return;
+
+                }
+                $data = [
+                    'total_fee' => $_POST['total_amount'],
+                    'out_trade_no' => $out_trade_no,
+                    'trade_no' => $_POST['trade_no'],
+                    'unit' => 'yuan',
+                    'pay_type' => $this->sign_type[$_POST['sign_type']],
+                    'pay_type_id' => $this->pay_type_id
+
+                ];
+                $this->payResutl($data);
+            }
+
+            echo "success";
+        } else {
+            echo "fail";
+        }
+    }
+
+
+    /**
+     * Redis 防重校验（SETNX + EXPIRE 原子操作）
+     */
+    protected function checkDuplicateWithRedis(string $key): bool
+    {
+        $luaScript = <<<LUA
+if redis.call("SETNX", KEYS[1], 1) == 1 then
+    redis.call("EXPIRE", KEYS[1], ARGV[1])
+    return 1
+else
+    return 0
+end
+LUA;
+
+        return (bool) Redis::eval($luaScript, 1, $key, 86400);
+    }
+
+    public function returnUrl()
+    {
+        if (isset($_GET['alipayresult']) && !empty($_GET['alipayresult'])) {
+            $alipayresult = json_decode($_GET['alipayresult'], true);
+            if (strpos($alipayresult['alipay_trade_app_pay_response']['out_trade_no'], '_') !== false) {
+                $data = explode('_', $alipayresult['alipay_trade_app_pay_response']['out_trade_no']);
+                $out_trade_no = $data[1];
+                \YunShop::app()->uniacid = $data[0];
+            } else {
+                $out_trade_no = $alipayresult['alipay_trade_app_pay_response']['out_trade_no'];
+            }
+            \Log::debug('=========支付宝APP支付2.0==========:', $alipayresult['alipay_trade_app_pay_response']);
+        } elseif (strpos($_GET['out_trade_no'], '_') !== false) {
+            $data = explode('_', $_GET['out_trade_no']);
+            if (count($data) == 2) {
+                $out_trade_no = $data[1];
+                \YunShop::app()->uniacid = $data[0];
+                \Log::debug('=============商城支付宝APP支付2.0==========:', $data);
+            } else {
+                $out_trade_no = $data[0];
+                \YunShop::app()->uniacid = $data[1];
+                \Log::debug('========支付宝JSAPI支付（服务商）=====:', $data);
+            }
+
+        } else {
+            $out_trade_no = $this->substr_var($_GET['out_trade_no']);
+        }
+
+        $orderPay = OrderPay::where('pay_sn', $out_trade_no)->first();
+
+        if (!is_null($orderPay)) {
+            $orders = Order::whereIn('id', $orderPay->order_ids)->get();
+            event($event = new AfterOrderPaidRedirectEvent($orders, $orderPay->id));
+        }
+
+        $trade = \Setting::get('shop.trade');
+        //这里做支付后跳转，需要取到支付流水号
+        //$redirect = Url::absoluteApp('home');
+        //$redirect = Url::absoluteApp('orderPaySuccess',['pay'=> $orderPay->id]);
+        $uniacid = \YunShop::app()->uniacid;
+        $redirect = 'https://' .$_SERVER['HTTP_HOST'] ."/plugins/shop_server/myorder/paymentresult?i={$uniacid}&id={$orderPay->order_id}&payid={$orderPay->id}";
+        /*if (!is_null($trade) && isset($trade['redirect_url']) && !empty($trade['redirect_url'])) {
+            $redirect = $trade['redirect_url'];
+            preg_match("/^(http:\/\/)?([^\/]+)/i", $trade['redirect_url'], $matches);
+            $host = $matches[2];
+            // 从主机名中取得后面两段
+            preg_match("/[^\.\/]+\.[^\.\/]+$/", $host, $matches);
+            if ($matches) {//判断域名是否一致
+                $redirect = $trade['redirect_url'] . '&outtradeno=' . $out_trade_no;
+            }
+        }*/
+
+//        if (isset($event)) {
+//            $redirect = $event->getData()['redirect'] ?: $redirect;
+//        }
+        redirect($redirect)->send();
+    }
+
+    public function jsapiNotifyUrl()
+    {
+        $this->log($_POST, '支付宝支付2.0');
+        if ($_POST['sign_type'] == 'MD5') {
+            $verify_result = $this->getSignResult();
+        } else {
+            $verify_result = $this->get_Jsapi_RSA2_SignResult($_POST);
+        }
+
+        \Log::debug(sprintf('支付回调验证结果[%d]', intval($verify_result)));
+
+        $verify_result = true;
+        if ($verify_result) {
+            if ($_POST['trade_status'] == 'TRADE_SUCCESS') {
+                if ($_POST['sign_type'] == 'RSA2') {
+                    if (strpos($_POST['out_trade_no'], '_') !== false) {
+                        $trade_no = explode('_', $_POST['out_trade_no']);
+                        $out_trade_no = $trade_no[0];
+                    } else {
+                        $out_trade_no = $_POST['out_trade_no'];
+                    }
+                } else {
+                    $out_trade_no = $_POST['out_trade_no'];
+                }
+
+                $total_key = $this->total_fee[$_POST['sign_type']];
+                $data = [
+                    'total_fee' => $_POST[$total_key],
+                    'out_trade_no' => $out_trade_no,
+                    'trade_no' => $_POST['trade_no'],
+                    'unit' => 'yuan',
+                    'pay_type' => $this->sign_type[$_POST['sign_type']],
+                    'pay_type_id' => PayType::ALIPAY_JSAPI_PAY
+
+                ];
+
+                $this->alipayPayResult($data, $trade_no[2]);
+                $this->payResutl($data);
+            }
+
+            echo "success";
+        } else {
+            echo "fail";
+        }
+    }
+
+    /**
+     * 门店POS分账功能
+     * @param $result
+     * @param $royalty
+     */
+    public function alipayPayResult($result, $royalty)
+    {
+        $orderPay = OrderPay::where('pay_sn', $result['out_trade_no'])->first();
+        $order = $orderPay->orders->first();
+        $store_order = StoreOrder::where('order_id', $order->id)->first();
+        $store_id = $store_order->store_id;
+        request()->offsetSet('store_id', $store_id);
+        $data = [
+            'uniacid' => \Yunshop::app()->uniacid,
+            'order_id' => $order->id,
+            'order_sn' => $order->order_sn,
+            'member_id' => $order->uid,
+            'account_id' => request()->store_id,
+            'pay_sn' => $result['out_trade_no'],
+            'trade_no' => $result['trade_no'],
+            'total_amount' => $result['total_fee'],
+            'royalty' => $royalty,
+        ];
+        AlipayPayOrder::create($data);
+    }
+
+    //判断返回的数据是否是json格式
+    protected function is_json($string)
+    {
+        json_decode($string);
+        return (json_last_error() == JSON_ERROR_NONE);
+    }
+
+    public function refundNotifyUrl()
+    {
+        \Log::debug('支付宝退款回调');
+
+        $this->refundLog($_POST, '支付宝退款');
+
+        $verify_result = $this->getSignResult();
+
+        \Log::debug(sprintf('支付回调验证结果[%d]', intval($verify_result)));
+
+        if ($verify_result) {
+            if ($_POST['success_num'] >= 1) {
+                $plits = explode('^', $_POST['result_details']);
+
+                if ($plits[2] == 'SUCCESS') {
+                    $data = [
+                        'total_fee' => $plits[1],
+                        'trade_no' => $plits[0],
+                        'unit' => 'yuan',
+                        'pay_type' => '支付宝',
+                        'batch_no' => $_POST['batch_no']
+                    ];
+
+                    $this->refundResutl($data);
+                }
+            }
+
+            echo "success";
+        } else {
+            echo "fail";
+        }
+
+    }
+
+    public function withdrawNotifyUrl()
+    {
+        $data = [];
+        \Log::debug('支付宝提现回调');
+        $this->withdrawLog($_POST, '支付宝提现');
+
+        $verify_result = $this->getSignResult();
+
+        \Log::debug(sprintf('支付回调验证结果[%d]', intval($verify_result)));
+
+        if ($verify_result) {
+            if ($_POST['success_details']) {
+                $post_success_details = explode('|', rtrim($_POST['success_details'], '|'));
+
+                foreach ($post_success_details as $success_details) {
+                    $plits = explode('^', $success_details);
+
+                    if ($plits[4] == 'S') {
+                        $data[] = [
+                            'total_fee' => $plits[3],
+                            'trade_no' => $plits[0],
+                            'unit' => 'yuan',
+                            'pay_type' => '支付宝'
+                        ];
+                    }
+                }
+
+                $this->withdrawResutl($data);
+            } elseif ($_POST['fail_details']) {
+                $post_fail_details = explode('|', rtrim($_POST['fail_details'], '|'));
+
+                foreach ($post_fail_details as $fail_details) {
+                    $plits = explode('^', $fail_details);
+
+                    if ($plits[4] == 'F') {
+                        $data[] = [
+                            'total_fee' => $plits[3],
+                            'trade_no' => $plits[0],
+                        ];
+                    }
+                }
+
+                $this->withdrawFailResutl($data);
+            }
+
+            echo "success";
+        } else {
+            echo "fail";
+        }
+    }
+
+    /**
+     * 签名验证
+     *
+     * @return bool
+     */
+    public function getSignResult()
+    {
+        \Log::debug(sprintf('Uniacid[%d]', \YunShop::app()->uniacid));
+        $key = \Setting::get('alipay-web.key');
+        \Log::debug(sprintf('$key %s', $key));
+        $alipay = app('alipay.web');
+        $alipay->setSignType('MD5');
+        $alipay->setKey($key);
+
+        return $alipay->verify();
+    }
+
+    /**
+     * app签名验证
+     *
+     * @return bool
+     */
+    public function get_RSA_SignResult($params)
+    {
+        $sign = $params['sign'];
+        $params['sign_type'] = null;
+        $params['sign'] = null;
+        return $this->verify($this->getSignContent($params), $sign);
+    }
+
+    /**
+     * app2.0签名验证
+     *
+     * @return bool
+     */
+    public function get_RSA2_SignResult($params)
+    {
+        $sign = $params['sign'];
+        $params['sign_type'] = null;
+        $params['sign'] = null;
+        return $this->verify2($this->getSignContent($params), $sign);
+    }
+
+    /**
+     * app2.0签名验证
+     *
+     * @return bool
+     */
+    public function get_Jsapi_RSA2_SignResult($params)
+    {
+        $sign = $params['sign'];
+        $params['sign_type'] = null;
+        $params['sign'] = null;
+        return $this->verify3($this->getSignContent($params), $sign);
+    }
+
+    /**
+     * 通过支付宝公钥验证回调信息
+     *
+     * @param $data
+     * @param $sign
+     * @return bool
+     */
+    function verify($data, $sign)
+    {
+        $alipay_sign_public = \Setting::get('shop_app.pay.alipay_sign_public');
+        //如果isnewalipay为1，则为rsa2支付类型
+        $isnewalipay = \Setting::get('shop_app.pay.newalipay');
+        if (!$this->checkEmpty($alipay_sign_public)) {
+            $res = "-----BEGIN PUBLIC KEY-----\n" .
+                wordwrap($alipay_sign_public, 64, "\n", true) .
+                "\n-----END PUBLIC KEY-----";
+        }
+        ($res) or die('支付宝RSA公钥错误。请检查公钥文件格式是否正确');
+        //调用openssl内置方法验签，返回bool值
+        $result = (bool)openssl_verify($data, base64_decode($sign), $res, OPENSSL_ALGO_SHA256);
+
+        openssl_free_key($res);
+        return $result;
+    }
+
+
+    /**
+     * 通过支付宝公钥验证回调信息
+     *
+     * @param $data
+     * @param $sign
+     * @return bool
+     */
+    function verify2($data, $sign)
+    {
+        $set = \Setting::get('shop.pay');
+        $alipay_sign_public = decrypt($set['rsa_public_key']);
+        //如果isnewalipay为1，则为rsa2支付类型
+        if (!$this->checkEmpty($alipay_sign_public)) {
+            $res = "-----BEGIN PUBLIC KEY-----\n" .
+                wordwrap($alipay_sign_public, 64, "\n", true) .
+                "\n-----END PUBLIC KEY-----";
+        }
+        ($res) or die('支付宝RSA公钥错误。请检查公钥文件格式是否正确');
+        //调用openssl内置方法验签，返回bool值
+        $result = (bool)openssl_verify($data, base64_decode($sign), $res, OPENSSL_ALGO_SHA256);
+        openssl_free_key($res);
+        return $result;
+    }
+
+    /**
+     * 通过支付宝公钥验证回调信息
+     *
+     * @param $data
+     * @param $sign
+     * @return bool
+     */
+    function verify3($data, $sign)
+    {
+        $res = '';
+        $set = \Setting::get('shop.alipay_set');
+        $alipay_sign_public = $set['alipay_public_key'];
+        //如果isnewalipay为1，则为rsa2支付类型
+        if (!$this->checkEmpty($alipay_sign_public)) {
+            $res = "-----BEGIN PUBLIC KEY-----\n" .
+                wordwrap($alipay_sign_public, 64, "\n", true) .
+                "\n-----END PUBLIC KEY-----";
+        }
+        ($res) or die('支付宝RSA公钥错误。请检查公钥文件格式是否正确');
+        //调用openssl内置方法验签，返回bool值
+        $result = (bool)openssl_verify($data, base64_decode($sign), $res, OPENSSL_ALGO_SHA256);
+
+        if (!$this->checkEmpty($alipay_sign_public)) {
+            //释放资源
+            openssl_free_key($res);
+        }
+        return $result;
+    }
+
+    /**
+     * 验证数组重组
+     *
+     * @param $params
+     * @return string
+     */
+    public function getSignContent($params)
+    {
+        ksort($params);
+        $stringToBeSigned = "";
+        $i = 0;
+        foreach ($params as $k => $v) {
+            if (false === $this->checkEmpty($v) && "@" != substr($v, 0, 1)) {
+
+                // 转换成目标字符集
+                $v = $this->characet($v, 'UTF-8');
+
+                if ($i == 0) {
+                    $stringToBeSigned .= "$k" . "=" . "$v";
+                } else {
+                    $stringToBeSigned .= "&" . "$k" . "=" . "$v";
+                }
+                $i++;
+            }
+        }
+
+        unset ($k, $v);
+        return $stringToBeSigned;
+    }
+
+    /**
+     * 校验$value是否非空
+     *  if not set ,return true;
+     *    if is null , return true;
+     **/
+    protected function checkEmpty($value)
+    {
+        if (!isset($value))
+            return true;
+        if ($value === null)
+            return true;
+        if (trim($value) === "")
+            return true;
+
+        return false;
+    }
+
+    /**
+     * 转换字符集编码
+     * @param $data
+     * @param $targetCharset
+     * @return string
+     */
+    function characet($data, $targetCharset)
+    {
+
+        if (!empty($data)) {
+            $fileType = $this->fileCharset;
+            if (strcasecmp($fileType, $targetCharset) != 0) {
+                $data = mb_convert_encoding($data, $targetCharset, $fileType);
+                //              $data = iconv($fileType, $targetCharset.'//IGNORE', $data);
+            }
+        }
+
+
+        return $data;
+    }
+
+    /**
+     * 响应日志
+     *
+     * @param $post
+     */
+    public function log($post, $desc)
+    {
+        //访问记录
+        Pay::payAccessLog();
+        //保存响应数据
+        Pay::payResponseDataLog($post['out_trade_no'], $desc, json_encode($post));
+    }
+
+    public function refundLog($post, $desc)
+    {
+        //访问记录
+        Pay::payAccessLog();
+        //保存响应数据
+        Pay::payResponseDataLog(0, $desc, json_encode($post));
+    }
+
+    public function withdrawLog($post, $desc)
+    {
+        //访问记录
+        Pay::payAccessLog();
+        //保存响应数据
+        Pay::payResponseDataLog($post['batch_no'], $desc, json_encode($post));
+    }
+
+
+    /**
+     * 支付宝退款回调操作
+     *
+     * @param $data
+     */
+    public function refundResutl($data)
+    {
+        \Log::debug('退款操作', 'refund.succeeded');
+
+        $pay_order = PayOrder::getPayOrderInfoByTradeNo($data['trade_no'])->first();
+
+        if (!$pay_order) {
+            return \Log::error('未找到退款订单支付信息', $data);
+        }
+        $pay_refund_model = PayRefundOrder::getOrderInfo($pay_order->out_order_no);
+
+
+        if (!$pay_refund_model) {
+            return \Log::error('退款订单支付信息保存失败', $data);
+
+        }
+
+        $pay_refund_model->status = 2;
+        $pay_refund_model->trade_no = $pay_refund_model->trade_no;
+        $pay_refund_model->type = $data['pay_type'];
+        $pay_refund_model->save();
+
+        $refundApply = RefundApply::where('alipay_batch_sn', $data['batch_no'])->first();
+
+        if (!isset($refundApply)) {
+            return \Log::error('订单退款信息不存在', $data);
+        }
+        if (!(bccomp($refundApply->price, $data['total_fee'], 2) == 0)) {
+            return \Log::error("订单退款金额错误(订单金额:{$refundApply->price}|退款金额:{$data['total_fee']})|比较结果:" . bccomp($refundApply->price, $data['total_fee'], 2) . ")");
+        }
+
+
+        \Log::debug('订单退款(退款申请id:' . $refundApply->id . ',订单id:' . $refundApply->order_id . ')');
+        RefundOperationService::refundComplete(['id' => $refundApply->id]);
+
+
+    }
+
+    /**
+     * 支付宝提现回调操作
+     *
+     * @param $data
+     */
+    public function withdrawResutl($params)
+    {
+        if (!empty($params)) {
+            foreach ($params as $data) {
+                $pay_refund_model = PayWithdrawOrder::getOrderInfo($data['trade_no']);
+
+                if ($pay_refund_model) {
+                    $pay_refund_model->status = 2;
+                    $pay_refund_model->trade_no = $data['trade_no'];
+                    $pay_refund_model->save();
+                }
+
+                \Log::debug('提现操作', 'withdraw.succeeded');
+
+                if (bccomp($pay_refund_model->price, $data['total_fee'], 2) == 0) {
+                    Withdraw::paySuccess($data['trade_no']);
+
+                    event(new AlipayWithdrawEvent($data['trade_no']));
+                }
+            }
+        }
+    }
+
+    public function withdrawFailResutl($params)
+    {
+        $trade_no = [];
+
+        if (!empty($params)) {
+            foreach ($params as $data) {
+                $pay_refund_model = PayWithdrawOrder::getOrderInfo($data['trade_no']);
+
+                if ($pay_refund_model) {
+                    \Log::debug('提现操作', 'withdraw.failed');
+
+                    if (bccomp($pay_refund_model->price, $data['total_fee'], 2) == 0) {
+                        Withdraw::payFail($data['trade_no']);
+                    }
+                }
+            }
+        }
+    }
+}

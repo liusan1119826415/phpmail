@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>路径测试</title>
+</head>
+<body>
+    <h1>路径测试</h1>
+    <p>Three.js路径: {{ static_url('js/three/three.module.js') }}</p>
+    <p>Tween.js路径: {{ static_url('js/tween.esm.js') }}</p>
+    <p>Three.js addons路径: {{ static_url('js/three/addons/') }}</p>
+    
+    <h2>测试文件访问</h2>
+    <script>
+        // 测试three.js文件是否可以访问
+        fetch('{{ static_url('js/three/three.module.js') }}')
+            .then(response => {
+                console.log('Three.js响应状态:', response.status);
+                console.log('Three.js响应类型:', response.headers.get('content-type'));
+                return response.text();
+            })
+            .then(text => {
+                console.log('Three.js文件开头:', text.substring(0, 100));
+            })
+            .catch(error => {
+                console.error('Three.js加载错误:', error);
+            });
+            
+        // 测试tween.js文件是否可以访问
+        fetch('{{ static_url('js/tween.esm.js') }}')
+            .then(response => {
+                console.log('Tween.js响应状态:', response.status);
+                console.log('Tween.js响应类型:', response.headers.get('content-type'));
+                return response.text();
+            })
+            .then(text => {
+                console.log('Tween.js文件开头:', text.substring(0, 100));
+            })
+            .catch(error => {
+                console.error('Tween.js加载错误:', error);
+            });
+    </script>
+</body>
+</html>
+

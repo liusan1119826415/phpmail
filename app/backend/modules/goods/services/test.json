@@ -1,0 +1,426 @@
+
+
+
+//产品保存参数
+{
+    "has_option": 1,
+    "specs": [[
+    {
+        "id": 37,
+        "title": "尺寸",
+        "modelType":0,    //模型类型 0 独立位或十字型 1首位或T字型 2 延伸位或F型 3 尾位
+        "goods_id": 43,
+        "spec_item": [
+            {
+                "id": 69,
+                "specid": 37,
+                "title": "125*200cm",
+                "show": 1,
+                "initialTitle": "125*200cm"
+            },
+            {
+                "id": 70,
+                "specid": 37,
+                "title": "120*800cm",
+                "show": 1,
+                "initialTitle": "120*800cm"
+            }
+        ],
+        "initialTitle": "尺寸"
+    }
+],
+    [
+        {
+            "id": 37,
+            "title": "尺寸",
+            "modelType":1,  //  模型类型 0 独立位或十字型 1首位或T字型 2 延伸位或F型 3 尾位
+            "goods_id": 43,
+            "spec_item": [
+                {
+                    "id": 69,
+                    "specid": 37,
+                    "title": "125*200cm",
+                    "show": 1,
+                    "initialTitle": "125*200cm"
+                },
+                {
+                    "id": 70,
+                    "specid": 37,
+                    "title": "120*800cm",
+                    "show": 1,
+                    "initialTitle": "120*800cm"
+                }
+            ],
+            "initialTitle": "尺寸"
+        }
+    ],
+    [
+        {
+            "id": 37,
+            "title": "尺寸",
+            "modelType":2,  //  模型类型 0 独立位或十字型 1首位或T字型 2 延伸位或F型 3 尾位
+            "goods_id": 43,
+            "spec_item": [
+                {
+                    "id": 69,
+                    "specid": 37,
+                    "title": "125*200cm",
+                    "show": 1,
+                    "initialTitle": "125*200cm"
+                },
+                {
+                    "id": 70,
+                    "specid": 37,
+                    "title": "120*800cm",
+                    "show": 1,
+                    "initialTitle": "120*800cm"
+                }
+            ],
+            "initialTitle": "尺寸"
+        }
+    ],
+    [
+        {
+            "id": 37,
+            "title": "尺寸",
+            "modelType":3,  //  模型类型 0 独立位或十字型 1首位或T字型 2 延伸位或F型 3 尾位
+            "goods_id": 43,
+            "spec_item": [
+                {
+                    "id": 69,
+                    "specid": 37,
+                    "title": "125*200cm",
+                    "show": 1,
+                    "initialTitle": "125*200cm"
+                },
+                {
+                    "id": 70,
+                    "specid": 37,
+                    "title": "120*800cm",
+                    "show": 1,
+                    "initialTitle": "120*800cm"
+                }
+            ],
+            "initialTitle": "尺寸"
+        }
+    ]
+
+],
+    "option": [
+        [
+    {
+        "id": 103,
+        "uniacid": 1,
+        "goods_id": 43,
+        "title": "125*200cm",
+        "thumb": null,
+        "product_price": "11.00",
+        "market_price": "11.00",
+        "cost_price": "11.00",
+        "stock": 111,
+        "weight": "1.00",
+        "display_order": 0,
+        "specs": "69",
+        "skuId": "",
+        "goods_sn": null,
+        "product_sn": null,
+        "virtual": 0,
+        "red_price": "",
+        "block_name": null,
+        "modelType": 0,
+        "d3model": "files/1/2024/10/870c1f159adfbe9782bb7fe2e05e1af8.obj",
+        "cad_plan_model": "files/1/2024/11/63859e71ffacbffdd1672c9eee485378.dwg",
+        "length": "1.00",
+        "width": "1.00",
+        "height": "1.00",
+        "package_number": 1,
+        "package_option": [
+            {
+                "length": "1",
+                "width": "1",
+                "height": "1"
+            }
+        ],
+        "volume": "0.000",
+        "withhold_stock": 0,
+        "尺寸": "125*200cm",
+        "combination": "125*200cm",
+        "d3modelName": "870c1f159adfbe9782bb7fe2e05e1af8.obj",
+        "cad_plan_modelName": "63859e71ffacbffdd1672c9eee485378.dwg",
+        "model_param": [
+            {
+                "id": 1,
+                "option_id": 103,
+                "name": "部件名称",
+                "changeLock": 1, //0 不可更改颜色  1 可以更改颜色
+                "default_color": "id",//推荐颜色
+                "select_color": "[1,2,3]", //可编辑的颜色
+                "is_hide": 0  //0 正常  1隐藏
+
+            },
+            {
+                "id": 2,
+                "option_id": 103,
+                "name": "部件名称",
+                "changeLock": 1, //0 不可更改颜色  1 可以更改颜色
+                "default_color": "id",//推荐颜色
+                "select_color": "[1,2,3]", //可编辑的颜色
+                "is_hide": 0  //0 正常  1隐藏
+
+            },
+            {
+                "id": 3,
+                "option_id": 103,
+                "name": "部件名称",
+                "changeLock": 1, //0 不可更改颜色  1 可以更改颜色
+                "default_color": "id",//推荐颜色
+                "select_color": "[1,2,3]", //可编辑的颜色
+                "is_hide": 0  //0 正常  1隐藏
+
+            }
+        ]
+    },
+    {
+        "id": 104,
+        "uniacid": 1,
+        "goods_id": 43,
+        "title": "120*800cm",
+        "thumb": null,
+        "product_price": "1.00",
+        "market_price": "11.00",
+        "cost_price": "1.00",
+        "stock": 111,
+        "weight": "1.00",
+        "display_order": 1,
+        "specs": "70",
+        "skuId": "",
+        "goods_sn": null,
+        "product_sn": null,
+        "virtual": 0,
+        "red_price": "",
+        "block_name": null,
+        "modelType": 0,
+        "d3model": "files/1/2024/10/870c1f159adfbe9782bb7fe2e05e1af8.obj",
+        "cad_plan_model": "files/1/2024/11/63859e71ffacbffdd1672c9eee485378.dwg",
+        "length": "1.00",
+        "width": "1.00",
+        "height": "1.00",
+        "package_number": 1,
+        "package_option": [
+            {
+                "length": "1",
+                "width": "1",
+                "height": "1"
+            }
+        ],
+        "volume": "0.000",
+        "withhold_stock": 0,
+        "尺寸": "120*800cm",
+        "combination": "120*800cm",
+        "d3modelName": "870c1f159adfbe9782bb7fe2e05e1af8.obj",
+        "cad_plan_modelName": "63859e71ffacbffdd1672c9eee485378.dwg",
+        "model_param": [
+            {
+                "id": 1,
+                "option_id": 104,
+                "name": "部件名称",
+                "changeLock": 1, //0 不可更改颜色  1 可以更改颜色
+                "default_color": "id",//推荐颜色
+                "select_color": "[1,2,3]", //可编辑的颜色
+                "is_hide": 0  //0 正常  1隐藏
+
+            },
+            {
+                "id": 2,
+                "option_id": 104,
+                "name": "部件名称",
+                "changeLock": 1, //0 不可更改颜色  1 可以更改颜色
+                "default_color": "id",//推荐颜色
+                "select_color": "[1,2,3]", //可编辑的颜色
+                "is_hide": 0  //0 正常  1隐藏
+
+            },
+            {
+                "id": 3,
+                "option_id": 104,
+                "name": "部件名称",
+                "changeLock": 1, //0 不可更改颜色  1 可以更改颜色
+                "default_color": "id",//推荐颜色
+                "select_color": "[1,2,3]", //可编辑的颜色
+                "is_hide": 0  //0 正常  1隐藏
+
+            }
+        ]
+    }
+]]
+}
+
+
+
+
+
+
+
+
+
+
+
+
+//产品增加参数
+
+{
+    "has_option": 1,
+    "specs": [[
+        {
+            "id": "SC0",
+            "title": "尺寸",
+            "initialTitle": "尺寸",
+            "modelType":0,
+            "spec_item": [
+                {
+                    "id": "SV0&SC0",
+                    "specid": "SC0",
+                    "title": "125*200*30cm",
+                    "initialTitle": "125*200*30cm"
+                },
+                {
+                    "id": "SV1&SC0",
+                    "specid": "SC0",
+                    "title": "130*135*90cm",
+                    "initialTitle": "130*135*90cm"
+                }
+            ]
+        }
+    ],
+    [
+        {
+            "id": "SC0",
+            "title": "尺寸",
+            "initialTitle": "尺寸",
+            "modelType":0,
+            "spec_item": [
+                {
+                    "id": "SV0&SC0",
+                    "specid": "SC0",
+                    "title": "125*200*30cm",
+                    "initialTitle": "125*200*30cm"
+                },
+                {
+                    "id": "SV1&SC0",
+                    "specid": "SC0",
+                    "title": "130*135*90cm",
+                    "initialTitle": "130*135*90cm"
+                }
+            ]
+        }
+    ]
+    ],
+    "option": [
+        [
+            {
+                "id": "SP1",
+                "title": "125*200*30cm",
+                "combination": "125*200*30cm",
+                "specs": "SV0&SC0",
+                "product_price": "22",
+                "singleType": 0, //1 单人位  0 双人位
+                "length": "1",
+                "width": "1",
+                "height": "1",
+                "weight": "1",
+                "package_number": 1,
+                "package_option": [
+                    {
+                        "length": "1",
+                        "width": "1",
+                        "height": "1"
+                    }
+                ],
+                "d3model": "files/1/2024/10/870c1f159adfbe9782bb7fe2e05e1af8.obj",
+                "d3modelName": "F136-H1.obj",
+                "cad_plan_model": "files/1/2024/11/63859e71ffacbffdd1672c9eee485378.dwg",
+                "cad_plan_modelName": "RBRWB(块).dwg",
+                "model_param": [
+                    {
+                        "name": "部件名称",
+                        "changeLock": 1, //0 不可更改颜色  1 可以更改颜色
+                        "default_color": "id",//推荐颜色
+                        "select_color": "[1,2,3]", //可编辑的颜色
+                        "is_hide": 0  //0 正常  1隐藏
+
+                    },
+                    {
+                        "name": "部件名称",
+                        "changeLock": 1, //0 不可更改颜色  1 可以更改颜色
+                        "default_color": "id",//推荐颜色
+                        "select_color": "[1,2,3]", //可编辑的颜色
+                        "is_hide": 0  //0 正常  1隐藏
+
+                    },
+                    {
+                        "name": "部件名称",
+                        "changeLock": 1, //0 不可更改颜色  1 可以更改颜色
+                        "default_color": "id",//推荐颜色
+                        "select_color": "[1,2,3]", //可编辑的颜色
+                        "is_hide": 0  //0 正常  1隐藏
+
+                    }
+                ]
+            },
+            {
+                "id": "SP2",
+                "title": "130*135*90cm",
+                "combination": "130*135*90cm",
+                "specs": "SV1&SC0",
+                "product_price": "33",
+                "singleType": 1, //1 单人位  0 双人位
+                "length": "1",
+                "width": "1",
+                "height": "1",
+                "weight": "2",
+                "package_number": 1,
+                "package_option": [
+                    {
+                        "length": "1",
+                        "width": "1",
+                        "height": "1"
+                    }
+                ],
+                "d3model": "files/1/2024/10/870c1f159adfbe9782bb7fe2e05e1af8.obj",
+                "d3modelName": "F136-H1.obj",
+                "cad_plan_model": "files/1/2024/11/63859e71ffacbffdd1672c9eee485378.dwg",
+                "cad_plan_modelName": "RBRWB(块).dwg",
+                "model_param": [
+                    {
+                        "name": "部件名称",
+                        "changeLock": 1, //0 不可更改颜色  1 可以更改颜色
+                        "default_color": "id",//推荐颜色
+                        "select_color": "[1,2,3]", //可编辑的颜色
+                        "is_hide": 0  //0 正常  1隐藏
+
+                    },
+                    {
+                        "name": "部件名称",
+                        "changeLock": 1, //0 不可更改颜色  1 可以更改颜色
+                        "default_color": "id",//推荐颜色
+                        "select_color": "[1,2,3]", //可编辑的颜色
+                        "is_hide": 0  //0 正常  1隐藏
+
+                    },
+                    {
+                        "name": "部件名称",
+                        "changeLock": 1, //0 不可更改颜色  1 可以更改颜色
+                        "default_color": "id",//推荐颜色
+                        "select_color": "[1,2,3]", //可编辑的颜色
+                        "is_hide": 0  //0 正常  1隐藏
+
+                    }
+                ]
+            }
+        ]
+    ]
+}
+
+
+
+

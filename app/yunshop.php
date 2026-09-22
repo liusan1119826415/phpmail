@@ -1,0 +1,620 @@
+<?php
+
+use app\frontend\modules\member\services\MemberAnchorAppService;
+use app\frontend\modules\member\services\MemberCpsAppService;
+use Illuminate\Support\Str;
+use app\common\services\PermissionService;
+use app\common\models\Menu;
+use app\common\services\Session;
+use app\common\exceptions\NotFoundException;
+
+
+//商城根目录
+define('SHOP_ROOT', dirname(__FILE__));
+
+
+class YunShop
+{
+    private static $_req;
+    private static $_app;
+    private static $_plugin;
+    private static $_notice;
+
+    public function __construct()
+    {
+
+    }
+
+    /**
+     * Configures an object with the initial property values.
+     * @param object $object the object to be configured
+     * @param array $properties the property initial values given in terms of name-value pairs.
+     * @return object the object itself
+     */
+    public static function configure($object, $properties)
+    {
+        foreach ($properties as $name => $value) {
+            $object->$name = $value;
+        }
+
+        return $object;
+    }
+
+    public static function getAppNamespace()
+    {
+        $rootName = 'app';
+        if (self::isWeb()) {
+            $rootName .= '\\backend';
+        }
+        if (self::isApp() || self::isApi()) {
+            $rootName .= '\\frontend';
+        }
+        return $rootName;
+    }
+
+    public static function getAppPath()
+    {
+        $path = dirname(__FILE__);
+        if (self::isWeb()) {
+            $path .= '/backend';
+        }
+        if (self::isApp() || self::isApi()) {
+            $path .= '/frontend';
+        }
+        return $path;
+    }
+
+    public static function isPHPUnit()
+    {
+        return strpos($_SERVER['PHP_SELF'], 'phpunit') !== false ? true : false;
+
+    }
+
+
+    public static function isWeb()
+    {
+        return request()->isBackend();
+    }
+
+    public static function isApp()
+    {
+        if (self::isPHPUnit()) {
+            return true;
+        }
+        return strpos($_SERVER['PHP_SELF'], '/app/index.php') !== false ? true : false;
+    }
+
+    public static function isApi()
+    {
+        return (strpos($_SERVER['PHP_SELF'], '/addons/') !== false &&
+            strpos($_SERVER['PHP_SELF'], '/api.php') !== false) ? true : false;
+    }
+
+    /**
+     *
+     * @return bool
+     */
+    public static function isWechatApi()
+    {
+        if (config('app.framework') == 'platform') {
+            return (strpos($_SERVER['REQUEST_URI'], '/wechat') !== false &&
+                strpos($_SERVER['REQUEST_URI'], '/api') !== false) ? true : false;
+        } else {
+            return (strpos($_SERVER['PHP_SELF'], '/addons/') === false &&
+                strpos($_SERVER['PHP_SELF'], '/api.php') !== false) ? true : false;
+        }
+    }
+
+    public static function isOutsideApi()
+    {
+        return strpos($_SERVER['REQUEST_URI'], '/outside') !== false ? true : false;
+    }
+
+    /**
+     * 是否插件
+     * @return bool
+     */
+    public static function isPlugin()
+    {
+        if (config('app.framework') == 'platform') {
+            return (strpos(request()->getRequestUri(), config('app.isWeb')) !== false &&
+                strpos(request()->getRequestUri(), '/plugin') !== false) ? true : false;
+        } else {
+            return (strpos($_SERVER['PHP_SELF'], '/web/') !== false &&
+                strpos($_SERVER['PHP_SELF'], '/plugin.php') !== false) ? true : false;
+        }
+    }
+
+    /**
+     * @name 验证是否商城操作员
+     * @return array|bool|null|stdClass
+     * @author
+     */
+    public static function isRole()
+    {
+        global $_W;
+
+        if (app('plugins')->isEnabled('supplier')) {
+            $res = \Illuminate\Support\Facades\DB::table('yz_supplier')->where('uid', $_W['uid'])->first();
+            if (!$res) {
+                return false;
+            }
+            return $res;
+        }
+        return false;
+    }
+
+    /**
+     * @name 验证是否文章营销管理员
+     * @author
+     * @return array|bool|null|stdClass
+     */
+    public static function isArticle()
+    {
+        global $_W;
+
+        if (app('plugins')->isEnabled('article')) {
+            if (!\Illuminate\Support\Facades\Schema::hasTable('yz_plugin_article_manager')) {
+                return false;
+            }
+
+
+            $res = \Illuminate\Support\Facades\DB::table('yz_plugin_article_manager')->where('uid', $_W['uid'])->first();
+            if (!$res) {
+                return false;
+            }
+            return $res;
+        }
+        return false;
+    }
+
+	/**
+	 * @name 验证是否商城操作员
+	 * @author
+	 * @return array|bool|null|stdClass
+	 */
+	public static function isAgencyCompany()
+	{
+		global $_W;
+
+		if (app('plugins')->isEnabled('agency-statistics')) {
+			$res = \Illuminate\Support\Facades\DB::table('yz_agency_company')->where('uid', $_W['uid'])->first();
+			if (!$res) {
+				return false;
+			}
+			return $res;
+		}
+		return false;
+	}
+
+    public static function cleanApp()
+    {
+        self::$_app = null;
+    }
+    /**
+     * @name 验证是否门店店长
+     * @return array|bool|null|stdClass
+     * @author
+     */
+    public static function isStore()
+    {
+        global $_W;
+
+        if (app('plugins')->isEnabled('store-cashier')) {
+            $res = \Illuminate\Support\Facades\DB::table('yz_store')->where('user_uid', $_W['uid'])->first();
+            if (!$res) {
+                return false;
+            }
+            return $res;
+        }
+        return false;
+    }
+
+    public static function isPayment()
+    {
+        return strpos($_SERVER['PHP_SELF'], '/payment/') > 0 ? true : false;
+    }
+
+    public static function request()
+    {
+        if (self::$_req !== null) {
+            return self::$_req;
+        } else {
+            self::$_req = new YunRequest();
+            return self::$_req;
+        }
+    }
+
+    /**
+     * @return YunApp
+     */
+    public static function app()
+    {
+        if (self::$_app !== null) {
+            return self::$_app;
+        } else {
+            self::$_app = new YunApp();
+            return self::$_app;
+        }
+    }
+
+    /**
+     * 解析路由
+     *
+     * 后台访问  /web/index.php?c=site&a=entry&m=sz_yi&do=xxx&route=module.controller.action
+     * 前台      /app/index.php....
+     *
+     * 多字母的路由用中划线隔开 比如：
+     *      TestCacheController
+     *          function testClean()
+     * 路由写法为   test-cache.test-clean
+     *
+     */
+//    public static function parseRoute($requestRoute)
+//    {
+//        try {
+//            $vers = [];
+//            $routes_params = explode('.', $requestRoute);
+//
+//            if (preg_match('/(v\d+)\./', $requestRoute, $vers)) {
+//                foreach ($routes_params as $key => $item) {
+//                    if ($item != $vers[1]) {
+//                        $routes[] = $item;
+//                    }
+//                }
+//            } else {
+//                $routes = $routes_params;
+//            }
+//
+//            $path = self::getAppPath();
+//            $namespace = self::getAppNamespace();
+//            $action = '';
+//            $controllerName = '';
+//            $currentRoutes = [];
+//            $modules = [];
+//
+//            if ($routes) {
+//                $length = count($routes);
+//                $routeFirst = array_first($routes);
+//                $countRoute = count($routes);
+//                if ($routeFirst === 'plugin' || self::isPlugin()) {
+//                    if (self::isPlugin()) {
+//                        $currentRoutes[] = 'plugin';
+//                        $countRoute += 1;
+//                    } else {
+//                        $currentRoutes[] = $routeFirst;
+//                        array_shift($routes);
+//                    }
+//                    $namespace = 'Yunshop';
+//                    $pluginName = array_shift($routes);
+//                    if ($pluginName || plugin($pluginName)) {
+//                        $currentRoutes[] = $pluginName;
+//                        $namespace .= '\\' . ucfirst(Str::camel($pluginName));
+//                        $path = base_path() . '/plugins/' . $pluginName . '/src';
+//                        $length = $countRoute;
+//
+//                        self::findRouteFile($controllerName, $action, $routes, $namespace, $path, $length, $currentRoutes, $requestRoute, true, $vers);
+//
+//                        if (!app('plugins')->isEnabled($pluginName)) {
+//                            throw new NotFoundException("{$pluginName}插件已禁用");
+//
+//                        }
+//                    } else {
+//                        throw new NotFoundException('无此插件');
+//
+//                    }
+//                } else {
+//
+//                    self::findRouteFile($controllerName, $action, $routes, $namespace, $path, $length, $currentRoutes, $requestRoute, false, $vers);
+//
+//                }
+//            }
+//        } catch (Exception $exception) {
+////            dd($exception);
+////            exit;
+//
+//        }
+//        //执行run
+//        return static::run($namespace, $modules, $controllerName, $action, $currentRoutes);
+//
+//    }
+
+    /**
+     * 定位路由相关文件
+     * @param $controllerName
+     * @param $action
+     * @param $routes
+     * @param $namespace
+     * @param $path
+     * @param $length
+     * @param $requestRoute
+     * @param $isPlugin
+     */
+    public static function findRouteFile(&$controllerName, &$action, $routes, &$namespace, &$path, $length, &$currentRoutes, $requestRoute, $isPlugin, $vers)
+    {
+
+        foreach ($routes as $k => $r) {
+            $ucFirstRoute = ucfirst(Str::camel($r));
+
+            if (empty($vers)) {
+                $controllerFile = $path . ($isPlugin ? '/' : '/controllers/') . $ucFirstRoute . 'Controller.php';
+            } else {
+                $controllerFile = $path . ($isPlugin ? '/' : '/controllers/') . 'vers/' . $vers[1] . '/' . $ucFirstRoute . 'Controller.php';
+            }
+
+            if (is_file($controllerFile)) {
+
+                if (empty($vers)) {
+                    $namespace .= ($isPlugin ? '' : '\\controllers') . '\\' . $ucFirstRoute . 'Controller';
+                } else {
+                    $namespace .= ($isPlugin ? '\\' : '\\controllers\\') . 'vers\\' . $vers[1] . '\\' . $ucFirstRoute . 'Controller';
+                }
+
+                $controllerName = $ucFirstRoute;
+                $path = $controllerFile;
+                $currentRoutes[] = $r;
+            } elseif (is_dir($path .= ($isPlugin ? '' : '/modules') . '/' . $r)) {
+                $namespace .= ($isPlugin ? '' : '\\modules') . '\\' . $r;
+                $modules[] = $r;
+                $currentRoutes[] = $r;
+            } else {
+                if ($length !== ($isPlugin ? $k + 3 : $k + 1)) {
+                    throw new NotFoundException('路由长度有误:' . $requestRoute);
+
+                }
+                $action = strpos($r, '-') === false ? $r : Str::camel($r);
+                $currentRoutes[] = $r;
+            }
+        }
+
+    }
+
+    public static function getUcfirstName($name)
+    {
+        if (strpos($name, '-')) {
+            $names = explode('-', $name);
+            $name = '';
+            foreach ($names as $v) {
+                $name .= ucfirst($v);
+            }
+        }
+        return ucfirst($name);
+    }
+
+    public static function plugin()
+    {
+        self::$_plugin = new YunPlugin();
+        return self::$_plugin;
+    }
+
+    public static function notice()
+    {
+        self::$_notice = new YunNotice();
+        return self::$_notice;
+    }
+
+    private static function getContent($controller, $action)
+    {
+
+        return (new \Illuminate\Pipeline\Pipeline(new \Illuminate\Container\Container()))
+            ->send(Illuminate\Http\Request::capture())
+            ->through(collect($controller->getMiddleware())->pluck('middleware')->all())
+            ->then(function ($request) use ($controller, $action) {
+                return $controller->$action($request);
+            });
+    }
+}
+
+class YunComponent implements ArrayAccess
+{
+    protected $values = [];
+
+    public function __set($name, $value)
+    {
+        return $this->values[$name] = $value;
+    }
+
+    public function __get($name)
+    {
+        if (!array_key_exists($name, $this->values)) {
+            $this->values[$name] = null;
+        }
+        return $this->values[$name];
+    }
+
+    function __isset($name)
+    {
+        return array_key_exists($name, $this->values);
+    }
+
+    public function set($name, $value)
+    {
+        $this->values[$name] = $value;
+        return $this;
+    }
+
+    public function get($key = null)
+    {
+        if (isset($key)) {
+            $result = json_decode(array_get($this->values, $key, null), true);
+            if (@is_array($result)) {
+                return $result;
+            }
+            return array_get($this->values, $key, null);
+        }
+        return $this->values;
+    }
+
+    public function offsetUnset($offset)
+    {
+        unset($this->values[$offset]);
+    }
+
+    public function offsetSet($offset, $value)
+    {
+        $this->values[$offset] = $value;
+    }
+
+    public function offsetGet($offset)
+    {
+        if (isset($this->values[$offset])) {
+            return $this->values[$offset];
+        }
+        return null;
+    }
+
+    public function offsetExists($offset)
+    {
+        if (isset($this->values[$offset])) {
+            return true;
+        }
+        return false;
+    }
+}
+
+class YunRequest extends YunComponent
+{
+
+    public function __construct()
+    {
+        $this->values = request()->input();
+    }
+}
+
+/**
+ * Class YunApp
+ * @property int uniacid
+ * @property int uid
+ */
+class YunApp extends YunComponent
+{
+    protected $values;
+    public $currentItems = [];
+
+    public function __construct()
+    {
+        global $_W;
+        $this->values = !YunShop::isWeb() && !YunShop::isWechatApi() ? $this->getW() : (array)$_W;
+    }
+
+    public function getW()
+    {
+        $uniacid = intval(trim(request()->get('i')?:config("app.IAPP")));
+        $account = \app\common\models\AccountWechats::getAccountByUniacid($uniacid);
+        return [
+            'uniacid' => $uniacid,
+            'weid'    => $uniacid,
+            'acid'    => $uniacid,
+            'account' => $account ? $account->toArray() : '',
+        ];
+    }
+
+
+    /**
+     * @return int
+     * @todo set member id from session
+     */
+    public function getMemberId($get_type = 0)
+    {
+        $member_id = 0;
+        $type = \Yunshop::request()->type ?: '';
+        $token = \Yunshop::request()->yz_token ?: '';
+        if ($get_type == 0 && request()->is_shop_pos && app('plugins')->isEnabled('shop-pos') && ($pos_uid = \Yunshop\ShopPos\services\CustomerService::getPosUid())) {
+            $member_id = $pos_uid;
+        } elseif ($get_type == 0 && request()->is_store_pos && app('plugins')->isEnabled('store-pos') && ($pos_uid = \Yunshop\StorePos\services\BuyerService::getBuyerMemberId())) {
+            $member_id = $pos_uid;
+        } elseif ($get_type == 0 && request()->live_install_order_replace && app('plugins')->isEnabled('live-install') && ($pos_uid = \Yunshop\LiveInstall\services\SettingService::cacheUid())) {
+            $member_id = $pos_uid;
+        } elseif ($type == 9) {
+            $native_app = new \app\frontend\modules\member\services\MemberNativeAppService();
+            $member_id = $native_app->getMemberId($token);
+        } elseif ($type == 14) {
+            $anchor_app = new MemberAnchorAppService();
+            $member_id = $anchor_app->getMemberId($token);
+        } elseif ($type == 15 && app('plugins')->isEnabled('aggregation-cps') && (!request()->appid || \Yunshop\AggregationCps\services\SettingManageService::getTrueKey() == request()->appid)) {
+            $cps_app = new MemberCpsAppService();
+            $member_id = $cps_app->getMemberId($token);
+        } elseif ($session_id = request()->input('min_token')) {
+            $session_data = \Illuminate\Support\Facades\Redis::hgetall('PHPSESSID:' . $session_id);
+            return $this->getSessionMemberId($session_data['data']);
+        } elseif (Session::get('member_id')) {
+            $member_id = Session::get('member_id');
+        }
+        return $member_id;
+    }
+
+    private function getSessionMemberId($read_data)
+    {
+        $member_data = '';
+        if (!empty($read_data)) {
+            preg_match_all('/yunzshop_([\w]+[^|]*|)/', $read_data, $name_matches);
+            preg_match_all('/(a:[\w]+[^}]*})/', $read_data, $value_matches);
+            if (!empty($name_matches)) {
+                foreach ($name_matches[0] as $key => $val) {
+                    if ($val == 'yunzshop_member_id') {
+                        $member_data = $val . '|' . $value_matches[0][$key];
+                    }
+                }
+            }
+        }
+        return unserialize(explode('|', $member_data)[1])['data'];
+    }
+
+
+}
+
+class YunPlugin
+{
+    protected $values;
+
+    public function __construct()
+    {
+        $this->values = false;
+    }
+
+    /**
+     * @param null $key
+     * @return bool
+     */
+    public function get($key = null)
+    {
+        if (isset($key)) {
+
+            if (app('plugins')->isEnabled($key)) {
+                return true;
+            }
+        }
+        return $this->values;
+    }
+
+}
+
+class YunNotice
+{
+    protected $key;
+    protected $value;
+
+    public function __construct()
+    {
+        $this->key = 'shop';
+    }
+
+    /**
+     * @param null $key
+     * @return bool
+     */
+    public function getNotSend($routes = null)
+    {
+        $this->value = $routes;
+        $routesData = explode('.', $routes);
+        if (count($routesData) > 1) {
+            $this->key = $routesData[0];
+            $this->value = $routesData[1];
+        }
+
+        $noticeConfig = Config::get('notice.' . $this->key);
+
+        return in_array($this->value, $noticeConfig) ? 0 : 1;
+    }
+
+}

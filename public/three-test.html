@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Three.js & Tween.js 本地导入测试</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #000;
+            overflow: hidden;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            font-family: Arial, sans-serif;
+            z-index: 100;
+        }
+        #tween-info {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            color: white;
+            font-family: Arial, sans-serif;
+            z-index: 100;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <h3>Three.js 本地导入测试</h3>
+        <p>如果看到绿色旋转的立方体，说明three.js本地导入成功！</p>
+    </div>
+    
+    <div id="tween-info">
+        <h3>Tween.js 本地导入测试</h3>
+        <p>如果看到红色圆形在移动和缩放，说明tween.js本地导入成功！</p>
+    </div>
+
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "/static/js/three/three.module.js",
+        "three/addons/": "/static/js/three/addons/",
+        "@tweenjs/tween.js": "/static/js/tween.esm.js"
+      }
+    }
+    </script>
+
+    <script type="module" src="/js/three-test.js"></script>
+    <script type="module" src="/js/tween-test.js"></script>
+</body>
+</html>

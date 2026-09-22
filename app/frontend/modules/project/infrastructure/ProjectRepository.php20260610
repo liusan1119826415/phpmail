@@ -1,0 +1,2442 @@
+<?php
+
+namespace app\frontend\modules\project\infrastructure;
+
+use app\common\exceptions\AppException;
+use app\common\exceptions\ShopException;
+use app\common\models\Address;
+use app\common\models\BaseModel;
+use app\common\models\goods\GoodsOptionModel;
+use app\common\models\kefu\ServiceUser;
+use app\common\models\MemberCart;
+use app\common\models\project\ProjectBid;
+use app\common\models\project\ProjectFactoryInspection;
+use app\common\models\project\ProjectProgress;
+use app\common\models\project\ProjectReport;
+use app\common\models\project\PurchasingModes;
+use app\frontend\models\GoodsOption;
+use app\frontend\models\Order;
+use app\frontend\models\OrderGoods;
+use app\frontend\modules\coupon\models\Goods;
+use app\frontend\modules\project\models\PptTemplate;
+use app\frontend\modules\project\models\Project;
+use app\frontend\modules\project\repositories\ProjectRepositoryInterface;
+use app\frontend\modules\project\models\FloorSpace;
+use app\frontend\modules\project\models\Floors;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Redis;
+use app\common\models\project\PlanImg;
+use app\common\models\project\ProjectPdf;
+use PhpOffice\PhpSpreadsheet\Calculation\MathTrig\Floor;
+use Yunshop\Supplier\common\models\Supplier;
+use Yunshop\Supplier\common\models\SupplierBidFiles;
+use Yunshop\Supplier\common\models\SupplierCharge;
+use Carbon\Carbon;
+use Illuminate\Support\Facades\Cache;
+use Yunshop\Supplier\common\models\SupplierColorPlane;
+use Yunshop\Supplier\common\models\SupplierService;
+use Yunshop\Supplier\common\models\SupplierServiceFee;
+
+class ProjectRepository extends BaseRepository implements ProjectRepositoryInterface
+{
+
+    public function __construct(Project $model)
+    {
+        parent::__construct($model);
+    }
+
+
+    /**
+     * 创建项目，包括楼层和空间
+     * @param array $data
+     * @return bool
+     */
+    public function createProject(array $data): int
+    {
+        $requestData = $data['project'];
+
+        if (!$requestData) {
+            throw new ShopException("不合法的参数");
+        }
+        $project_data = Project::where('name', $requestData['name'])->where('member_id', \YunShop::app()->getMemberId())->first();
+        if ($project_data) {
+            throw new ShopException("项目名称已经存在");
+        }
+
+        $thumb = null;
+        if (!empty($requestData['floors'])) {
+            foreach ($requestData['floors'] as &$floor) {
+                if ($floor['imgBase64'] ?? null) {
+                    $floor['thumb'] = self::uploadOssThumb($floor['imgBase64']);
+                }
+            }
+        }
+        return $this->transaction(function () use ($requestData) {
+            // 创建项目
+            $projectData = [
+                'member_id' => \YunShop::app()->getMemberId(),
+                'uniacid' => \YunShop::app()->uniacid,
+                'name' => $requestData['name'],
+                'status' => $requestData['status'] ?: 0,
+                'province_id' => $requestData['province_id'] ?: 0,
+                'city_id' => $requestData['city_id'] ?: 0,
+                'district_id' => $requestData['district_id'] ?: 0,
+                'address_detail' => $requestData['address_detail'] ?: '',
+                'contact_name' => $requestData['contact_name'] ?: '',
+                'phone' => $requestData['phone'] ?: '',
+            ];
+
+            $project = $this->save($projectData);
+
+            // 创建楼层及其对应的空间
+            if (!$requestData['floors']) {
+                //没有楼层默认一个楼层
+                $requestData['floors'] = [[
+                    "name" => "默认楼层",
+                    "spaces" => [
+                        [
+                            "name" => "默认空间"
+                        ]
+                    ]
+                ]];
+            }
+            if (!empty($requestData['floors'])) {
+                foreach ($requestData['floors'] as $key => $floor) {
+
+
+                    $floorData = [
+                        'project_id' => $project->id,
+                        'name' => $floor['name'],
+                        'sort' => $key
+                    ];
+
+
+
+                    if ($floor['thumb'] && $floor['goods_total']) {
+
+                        $floorData['is_cad'] = 1;
+                        $floorData['thumb'] = $floor['thumb'];
+                        $floorData['goods_total'] = $floor['goods_total'];
+                    }
+                    $floorModel = Floors::create($floorData);
+                    if (!empty($floor['spaces'])) {
+                        foreach ($floor['spaces'] as $k => $space) {
+                            $spaceData = [
+                                'project_id' => $project->id,
+                                'floor_id' => $floorModel->id,
+                                'name' => $space['name'],
+                                'sort' => $k,
+                            ];
+                            $space_model = FloorSpace::create($spaceData);
+
+                            if ($space['goods']) {
+                                $goods_data = [];
+                                foreach ($space['goods'] as $good) {
+                                    $goods_data[] = [
+                                        'project_id' => $project->id,  //项目id
+                                        'space_id' => $space_model->id,  //空间id
+                                        'floor_id' => $floorModel->id,  //楼层id
+                                        'goods_id' => $good['goods_id'],
+                                        'total' => $good['num'],
+                                        'option_id' => $good['option_id'] ?: 0,
+                                    ];
+                                    //$this->addGoodsSpace($goods_data);
+                                }
+                                $this->addGoodsSpaceBatch($goods_data);
+                            }
+                        }
+                    } else {
+                        throw new ShopException("空间必须");
+                    }
+                }
+            }/*else{
+                throw new ShopException("楼层必须");
+            }*/
+
+            return $project->id;
+        });
+    }
+
+    private function isJson($string)
+    {
+        json_decode($string);
+        return (json_last_error() == JSON_ERROR_NONE);
+    }
+
+
+    // public function editProject(array $data): bool
+    // {
+
+
+    //     $requestData = $data['project'];
+
+    //     $existing = Project::where('name', $requestData['name'])->where('member_id',\YunShop::app()->getMemberId())
+    //         ->where('id', '!=', $requestData['id'])  // 排除当前项目
+    //         ->exists();
+
+    //     if ($existing) {
+    //         throw new ShopException("项目名称已存在");
+    //     }
+    //     if (!$requestData) {
+    //         throw new ShopException("不合法的参数");
+    //     }
+    //     return $this->transaction(function () use ($requestData) {
+    //         $projectModel = Project::find($requestData['id']);
+    //         if (!$projectModel) {
+    //             throw new ShopException("没有找到项目");
+    //         }
+
+    //         // 获取当前激活的楼层和空间ID
+    //         $currentActiveFloorId = Floors::where('project_id', $projectModel->id)->where('activate', 1)->value('id');
+    //         $currentActiveSpaceId = FloorSpace::where('project_id', $projectModel->id)->where('activate', 1)->value('id');
+
+    //         $projectModel->name = $requestData['name'];
+    //         $projectModel->status = $requestData['status'];
+    //         $projectModel->province_id = $requestData['province_id'] ?: 0;
+    //         $projectModel->city_id = $requestData['city_id'] ?: 0;
+    //         $projectModel->district_id = $requestData['district_id'] ?: 0;
+    //         $projectModel->address_detail = $requestData['address_detail'] ?: '';
+    //         $projectModel->contact_name = $requestData['contact_name'] ?: '';
+    //         $projectModel->phone = $requestData['phone'] ?: '';
+    //         $projectModel->save();  // 更新项目
+    //         $floorsIds = [];
+    //         if (!empty($requestData['floors'])) {
+
+    //             $deletedActiveFloor = false;
+    //             $floorIds = array_column($requestData['floors'], 'id');
+    //             if ($currentActiveFloorId && in_array($currentActiveFloorId, $floorIds)) {
+    //                 $deletedActiveFloor = true;
+    //             }
+    //             // 处理楼层的增删改
+    //             foreach ($requestData['floors'] as $key => $floorData) {
+    //                 //获取楼层所有空间
+
+    //                 $floor = $this->updateOrCreateFloor($projectModel, $floorData, $key);
+    //                 $floorsIds[] = $floor->id;
+
+    //                 // 处理该楼层下的空间
+    //                 $spacesIds = $this->updateOrCreateSpaces($floor, $floorData['spaces']);
+
+    //                 // 删除不在请求中的空间
+    //                 FloorSpace::where('floor_id', $floor->id)
+    //                     ->whereNotIn('id', $spacesIds)
+    //                     ->delete();
+    //             }
+
+    //             // 删除不在请求中的楼层
+    //             $this->deleteUnusedFloors($projectModel, $floorsIds);
+    //         }
+
+    //         // 更新缓存或其他操作
+    //         $this->updateActivateCache(\YunShop::app()->getMemberId(), $projectModel->id);
+
+    //         return true;
+
+    //     });
+
+    // }
+
+
+    public function updateProject(array $data): bool
+    {
+        $requestData = $data['project'];
+
+        $existing = Project::where('name', $requestData['name'])
+            ->where('member_id', \YunShop::app()->getMemberId())
+            ->where('id', '!=', $requestData['id'])
+            ->exists();
+
+        if ($existing) {
+            throw new ShopException("项目名称已存在");
+        }
+        if (!$requestData) {
+            throw new ShopException("不合法的参数");
+        }
+        $projectModel = Project::find($requestData['id']);
+        if (!$projectModel) {
+            throw new ShopException("没有找到项目");
+        }
+
+
+        $projectModel->name = $requestData['name'];
+        $projectModel->status = $requestData['status'];
+        $projectModel->province_id = $requestData['province_id'] ?: 0;
+        $projectModel->city_id = $requestData['city_id'] ?: 0;
+        $projectModel->district_id = $requestData['district_id'] ?: 0;
+        $projectModel->address_detail = $requestData['address_detail'] ?: '';
+        $projectModel->contact_name = $requestData['contact_name'] ?: '';
+        $projectModel->phone = $requestData['phone'] ?: '';
+        $projectModel->save();
+        return true;
+    }
+
+
+    public function editProject(array $data): bool
+    {
+        $requestData = $data['project'];
+
+        $existing = Project::where('name', $requestData['name'])
+            ->where('member_id', \YunShop::app()->getMemberId())
+            ->where('id', '!=', $requestData['id'])
+            ->exists();
+
+        if ($existing) {
+            throw new ShopException("项目名称已存在");
+        }
+        if (!$requestData) {
+            throw new ShopException("不合法的参数");
+        }
+
+        return $this->transaction(function () use ($requestData) {
+            $projectModel = Project::find($requestData['id']);
+            if (!$projectModel) {
+                throw new ShopException("没有找到项目");
+            }
+
+            // 获取当前激活的楼层和空间ID
+            $currentActiveFloorId = Floors::where('project_id', $projectModel->id)
+                ->where('activate', 1)
+                ->value('id');
+
+            $currentActiveSpaceId = FloorSpace::where('project_id', $projectModel->id)
+                ->where('activate', 1)
+                ->value('id');
+
+            $projectModel->name = $requestData['name'];
+            $projectModel->status = $requestData['status'];
+            $projectModel->province_id = $requestData['province_id'] ?: 0;
+            $projectModel->city_id = $requestData['city_id'] ?: 0;
+            $projectModel->district_id = $requestData['district_id'] ?: 0;
+            $projectModel->address_detail = $requestData['address_detail'] ?: '';
+            $projectModel->contact_name = $requestData['contact_name'] ?: '';
+            $projectModel->phone = $requestData['phone'] ?: '';
+            $projectModel->save();
+
+            $floorsIds = [];
+            $needToSetNewActiveFloor = false;
+            $needToSetNewActiveSpace = false;
+
+            if (!empty($requestData['floors'])) {
+                // 检查是否删除了激活的楼层
+                $floorIdsFromRequest = array_column($requestData['floors'], 'id');
+                if ($currentActiveFloorId && !in_array($currentActiveFloorId, $floorIdsFromRequest)) {
+                    $needToSetNewActiveFloor = true;
+                }
+
+                // 如果原本没有激活楼层，也需要设置一个
+                if (!$currentActiveFloorId) {
+                    $needToSetNewActiveFloor = true;
+                }
+
+                // 处理楼层的增删改
+                $firstFloorId = null;
+                $firstFloor = null;
+
+                foreach ($requestData['floors'] as $key => $floorData) {
+                    $floor = $this->updateOrCreateFloor($projectModel, $floorData, $key);
+                    $floorsIds[] = $floor->id;
+
+                    // 记录第一个楼层，用于可能需要设置激活
+                    if ($firstFloorId === null) {
+                        $firstFloorId = $floor->id;
+                        $firstFloor = $floor;
+                    }
+
+                    // 检查这个楼层是否包含当前激活空间
+                    $spaceIdsFromRequest = [];
+                    $currentSpaceExistsInThisFloor = false;
+
+                    if (!empty($floorData['spaces'])) {
+                        $spaceIdsFromRequest = array_column($floorData['spaces'], 'id');
+
+                        // 如果当前激活空间在这个楼层中，检查是否被删除
+                        if ($currentActiveSpaceId && $currentActiveSpaceId) {
+                            $currentActiveSpace = FloorSpace::find($currentActiveSpaceId);
+                            if ($currentActiveSpace && $currentActiveSpace->floor_id == $floor->id) {
+                                // 激活空间在这个楼层
+                                if (!in_array($currentActiveSpaceId, $spaceIdsFromRequest)) {
+                                    // 空间被删除
+                                    if ($floor->id == $currentActiveFloorId) {
+                                        $needToSetNewActiveSpace = true;
+                                    }
+                                } else {
+                                    $currentSpaceExistsInThisFloor = true;
+                                }
+                            }
+                        }
+                    }
+
+                    // 处理该楼层下的空间
+                    $spacesIds = $this->updateOrCreateSpaces($floor, $floorData['spaces']);
+
+                    // 如果这个楼层是激活楼层，需要确保它有激活空间
+                    if ($floor->id == $currentActiveFloorId) {
+                        // 检查激活空间是否还存在
+                        $activeSpaceExists = FloorSpace::where('id', $currentActiveSpaceId)
+                            ->where('floor_id', $floor->id)
+                            ->exists();
+
+                        if (!$activeSpaceExists || $needToSetNewActiveSpace) {
+                            // 设置该楼层的第一个空间为激活
+                            $firstSpace = FloorSpace::where('floor_id', $floor->id)
+                                ->orderBy('id')
+                                ->first();
+                            if ($firstSpace) {
+                                // 取消其他空间的激活状态
+                                FloorSpace::where('floor_id', $floor->id)
+                                    ->update(['activate' => 0]);
+
+                                $firstSpace->activate = 1;
+                                $firstSpace->save();
+                                $needToSetNewActiveSpace = false;
+                            }
+                        }
+                    }
+
+                    // 删除不在请求中的空间
+                    FloorSpace::where('floor_id', $floor->id)
+                        ->whereNotIn('id', $spacesIds)
+                        ->delete();
+                }
+
+                // 如果需要设置新的激活楼层
+                if ($needToSetNewActiveFloor && $firstFloorId) {
+                    // 取消所有楼层的激活状态
+                    Floors::where('project_id', $projectModel->id)
+                        ->update(['activate' => 0]);
+
+                    // 设置第一个楼层为激活
+                    $firstFloor->activate = 1;
+                    $firstFloor->save();
+
+                    // 设置该楼层的第一个空间为激活
+                    $firstSpace = FloorSpace::where('floor_id', $firstFloorId)
+                        ->orderBy('id')
+                        ->first();
+                    if ($firstSpace) {
+                        // 取消所有空间的激活状态
+                        FloorSpace::where('project_id', $projectModel->id)
+                            ->update(['activate' => 0]);
+
+                        $firstSpace->activate = 1;
+                        $firstSpace->save();
+                    }
+                } elseif ($currentActiveFloorId && !$needToSetNewActiveFloor) {
+                    // 如果激活楼层还在，确保它有激活空间
+                    $activeSpaceExists = FloorSpace::where('floor_id', $currentActiveFloorId)
+                        ->where('activate', 1)
+                        ->exists();
+
+                    if (!$activeSpaceExists) {
+                        // 设置该楼层的第一个空间为激活
+                        $firstSpace = FloorSpace::where('floor_id', $currentActiveFloorId)
+                            ->orderBy('id')
+                            ->first();
+                        if ($firstSpace) {
+                            // 取消其他空间的激活状态
+                            FloorSpace::where('floor_id', $currentActiveFloorId)
+                                ->update(['activate' => 0]);
+
+                            $firstSpace->activate = 1;
+                            $firstSpace->save();
+                        }
+                    }
+                }
+
+                // 删除不在请求中的楼层
+                $this->deleteUnusedFloors($projectModel, $floorsIds);
+            } else {
+                // 如果没有楼层数据，清除所有楼层和空间
+                Floors::where('project_id', $projectModel->id)->delete();
+                // 空间会自动级联删除
+            }
+
+            // 更新缓存
+            $this->updateActivateCache(\YunShop::app()->getMemberId(), $projectModel->id);
+
+            return true;
+        });
+    }
+
+
+
+
+    public function spaceSort(array $data): bool
+    {
+        $requestData = $data['project'];
+
+        $existing = Project::where('name', $requestData['name'])
+            ->where('member_id', \YunShop::app()->getMemberId())
+            ->where('id', '!=', $requestData['id'])
+            ->exists();
+
+        if ($existing) {
+            throw new ShopException("项目名称已存在");
+        }
+
+        if (!$requestData) {
+            throw new ShopException("不合法的参数");
+        }
+
+        return $this->transaction(function () use ($requestData) {
+            $projectModel = Project::find($requestData['id']);
+            if (!$projectModel) {
+                throw new ShopException("没有找到项目");
+            }
+
+            $projectModel->name = $requestData['name'];
+            $projectModel->status = $requestData['status'];
+            $projectModel->province_id = $requestData['province_id'] ?: 0;
+            $projectModel->city_id = $requestData['city_id'] ?: 0;
+            $projectModel->district_id = $requestData['district_id'] ?: 0;
+            $projectModel->address_detail = $requestData['address_detail'] ?: '';
+            $projectModel->contact_name = $requestData['contact_name'] ?: '';
+            $projectModel->phone = $requestData['phone'] ?: '';
+            $projectModel->save();
+
+            $floorsIds = [];
+            if (!empty($requestData['floors'])) {
+                // 先收集所有空间ID，用于后续删除不在请求中的空间
+                $allSpaceIds = [];
+
+                // 处理楼层的增删改
+                foreach ($requestData['floors'] as $key => $floorData) {
+                    $floor = $this->updateOrCreateFloor($projectModel, $floorData, $key);
+                    $floorsIds[] = $floor->id;
+
+                    // 处理该楼层下的空间 - 修改为更新floor_id而不是删除重建
+                    $spaceIds = $this->updateSpacesFloorId($floor, $floorData['spaces']);
+                    $allSpaceIds = array_merge($allSpaceIds, $spaceIds);
+
+                    // 更新购物车中的 floor_id
+                    $this->updateCartFloorId($floor->id, $spaceIds);
+                }
+            }
+
+            // 更新缓存或其他操作
+            $this->updateActivateCache(\YunShop::app()->getMemberId(), $projectModel->id);
+
+            return true;
+        });
+    }
+
+
+
+    /**
+     * 更新空间的楼层ID和排序（不删除空间，只修改floor_id和sort）
+     *
+     * @param Floor $floor 目标楼层
+     * @param array $spacesData 空间数据
+     * @param int $floorIndex 楼层索引（用于排序）
+     * @return array 更新后的空间ID数组
+     */
+    protected function updateSpacesFloorId($floor, $spacesData): array
+    {
+        $spaceIds = [];
+
+        foreach ($spacesData as $spaceIndex => $spaceData) {
+            if (!empty($spaceData['id'])) {
+                // 更新现有空间的floor_id和排序
+                FloorSpace::where('id', $spaceData['id'])
+                    ->update([
+                        'floor_id' => $floor->id,
+                        'name' => $spaceData['name'] ?? '',
+                        'activate' => $spaceData['activate'] ?? 0,
+                        'sort' => $spaceIndex, // 更新空间在当前楼层中的排序
+                        // 其他需要更新的字段
+                        'updated_at' => time()
+                    ]);
+
+                $spaceIds[] = $spaceData['id'];
+            }
+        }
+
+        return $spaceIds;
+    }
+
+
+    /**
+     * 更新购物车中的楼层ID
+     *
+     * @param int $floorId 目标楼层ID
+     * @param array $spaceIds 空间ID数组
+     */
+    protected function updateCartFloorId(int $floorId, array $spaceIds)
+    {
+        if (!empty($spaceIds)) {
+            MemberCart::whereIn('space_id', $spaceIds)
+                ->update(['floor_id' => $floorId]);
+            OrderGoods::whereIn('space_id', $spaceIds)->update(['floor_id' => $floorId]);
+        }
+    }
+
+
+    //平面图更新
+    public function updateFloorCad(array $requestData): bool
+    {
+
+
+
+        if (!$requestData) {
+            throw new ShopException("不合法的参数");
+        }
+
+        $floor = Floors::find($requestData['floor_id']);
+        if (!$floor) {
+            throw new ShopException("楼层不存在");
+        }
+        if ($requestData['imgBase64'] && $requestData['goods_total']) {
+            $thumb = self::uploadOssThumb($requestData['imgBase64']);
+            $floor->thumb = $thumb;
+            $floor->goods_total = $requestData['goods_total'];
+            $floor->save();
+        }
+        return $this->transaction(function () use ($requestData, $floor) {
+
+
+            if (!empty($requestData['spaces'])) {
+                $this->deleteSpace($floor->id);
+                foreach ($requestData['spaces'] as $k => $space) {
+                    $spaceData = [
+                        'project_id' => $floor->project_id,
+                        'floor_id' => $floor->id,
+                        'name' => $space['name'],
+                        'sort' => $k,
+                    ];
+                    $space_model = FloorSpace::create($spaceData);
+
+                    if ($space['goods']) {
+                        $goods_data = [];
+                        foreach ($space['goods'] as $good) {
+                            $goods_data[] = [
+                                'project_id' => $floor->project_id,  //项目id
+                                'space_id' => $space_model->id,  //空间id
+                                'floor_id' => $floor->id,  //楼层id
+                                'goods_id' => $good['goods_id'],
+                                'total' => $good['num'],
+                                'option_id' => $good['option_id'] ?: 0,
+                            ];
+                        }
+                        $this->addGoodsSpaceBatch($goods_data);
+                    }
+                }
+                $project_activate = Project::where('id', $floor->project_id)->where('activate', 1)->first();
+                if ($project_activate) {
+                    $this->logout($floor->project_id);
+                }
+            } else {
+                throw new ShopException("空间必须");
+            }
+
+            return true;
+        });
+    }
+
+    protected function deleteSpace($floor_id)
+    {
+        FloorSpace::where('floor_id', $floor_id)->delete();
+        MemberCart::where('floor_id', $floor_id)->delete();
+    }
+
+
+    public function getFloors(int $project_id): array
+    {
+        $member_id = \YunShop::app()->getMemberId();
+        $project = Project::getProject($project_id, $member_id);
+        if (!$project) {
+            throw new ShopException("项目不存在");
+        }
+        $list = Floors::select("id", "name")->where('project_id', $project_id)->get();
+        if ($list) {
+            return $list->toArray();
+        }
+        return [];
+    }
+
+
+    public function switchActiveProject(int $project_id, int $floor_id = null, int $space_id = null): bool
+    {
+        $member_id = \YunShop::app()->getMemberId();
+        \Log::debug("===request===", ['project_id' => $project_id, 'floor_id' => $floor_id, 'space_id' => $space_id, 'member_id' => $member_id]);
+
+        DB::beginTransaction(); // 开始事务
+        try {
+            $project = Project::getProject($project_id);
+            if (!$project) {
+                DB::rollBack();
+                throw new ShopException("未找到该项目");
+            }
+            //更新当前项目为激活状态
+            $project->activate = 1;
+            $project->save();
+
+            //获取该项目的第一个楼层和第一个空间（如果是首次激活）
+            if (empty($floor_id) && empty($space_id)) {
+                // 如果没有提供 floor_id 和 space_id，则默认选择第一个楼层和空间
+                $firstFloor = Floors::getFirstFloor($project_id);
+                if (!$firstFloor) {
+                    DB::rollBack();
+                    throw new ShopException('该项目没有楼层');
+                }
+
+                $firstSpace = FloorSpace::getFirstSpace($firstFloor->id);
+                if (!$firstSpace) {
+                    DB::rollBack();
+                    throw new ShopException('该楼层没有空间');
+                }
+
+                // 设置默认激活的楼层和空间
+                $floor_id = $firstFloor->id;
+                $space_id = $firstSpace->id;
+            } elseif (empty($space_id) && !empty($floor_id)) {
+                $firstSpace = FloorSpace::getFirstSpace($floor_id);
+                if (!$firstSpace) {
+                    DB::rollBack();
+                    throw new ShopException('该楼层没有空间');
+                }
+                $space_id = $firstSpace->id;
+            } elseif (!empty($space_id) && !empty($floor_id)) {
+                $floorSpace = FloorSpace::where('project_id', $project_id)->where('floor_id', $floor_id)->where('id', $space_id)->first();
+                if (!$floorSpace) {
+                    DB::rollBack();
+                    throw new ShopException('该楼层没有此空间');
+                }
+            }
+
+            // 更新楼层和空间的激活状态
+            Floors::updateActivateFloor($project_id, $floor_id);
+
+            FloorSpace::updateActivateSpace($floor_id, $space_id);
+
+
+            Project::updateOtherActivate($project_id);
+            Floors::updateOtherActivate($project_id, $floor_id);
+            FloorSpace::updateOtherActivate($project_id, $space_id);
+
+            //查询当前激活的项目更新缓存
+            $this->updateActivateCache($member_id, $project_id);
+            DB::commit(); // 提交事务
+            return true;
+        } catch (\Exception $e) {
+            DB::rollBack(); // 回滚事务
+            throw new ShopException(config("app.debug") ? $e->getMessage() : "异常失败");
+        }
+    }
+
+
+    public function getActiveProject(): array
+    {
+        $member_id = \YunShop::app()->getMemberId();
+        $cachedProjectData = Redis::get("user:{$member_id}:active_project_1");
+
+        if ($cachedProjectData) {
+            // 如果缓存中存在数据，直接返回
+            return json_decode($cachedProjectData, true);
+        }
+
+        // 如果缓存没有，查询数据库并缓存结果
+        $projectId = Project::where('member_id', $member_id)
+            ->where('activate', 1)
+            ->value('id');
+        if ($projectId) {
+            return $this->updateActivateCache($member_id, $projectId);
+        }
+
+        return [];
+    }
+
+
+    //获取省市
+    public function getProvinceCity(int $id): array
+    {
+        $id = $id ?: 0;
+
+        $provinceData = Redis::get("data:{$id}:province");
+
+        if ($provinceData) {
+            return json_decode($provinceData, true);
+        }
+
+        $data = Address::select("id", "areaname")->where('parentid', $id)->get()->toArray();
+        $baseCacheTime = 24 * 60 * 60; // 基础缓存时间：一天
+        $randomFactor = rand(10, 99);
+        $cacheTime = (int)($baseCacheTime * $randomFactor); // 计算缓存时间
+        Redis::setex("data:{$id}:province", $cacheTime, json_encode($data));
+        return $data;
+    }
+
+
+    public function getMyProject(): array
+    {
+        $member_id = \YunShop::app()->getMemberId();
+        $list = Project::select("id", "name", "activate", "status")->where("member_id", $member_id)->orderBy('created_at', 'desc')->get();
+        if ($list) {
+            return $list->toArray();
+        } else {
+            return [];
+        }
+    }
+
+    public function logout(int $project_id): bool
+    {
+        try {
+
+            //            $project = Project::getProject($project_id);
+            //            if (!$project) {
+            //                throw new ShopException("未找到项目");
+            //            }
+            $member_id = \YunShop::app()->getMemberId();
+            Project::where('id', $project_id)
+                ->where('activate', 1)
+                ->update(['activate' => 0]);
+            Floors::where('project_id', $project_id)
+                ->where('activate', 1)
+                ->update(['activate' => 0]);
+            FloorSpace::where('project_id', $project_id)
+                ->where('activate', 1)
+                ->update(['activate' => 0]);
+            Redis::del("user:{$member_id}:active_project_1");
+            return true;
+        } catch (\Exception $e) {
+            throw new ShopException("退出失败");
+        }
+    }
+
+    public function createFloor(int $project_id, string $floor_name): array
+    {
+        $project = Project::getProject($project_id);
+        if (!$project) {
+            throw new ShopException("未找到该项目");
+        }
+        if (!$floor_name) {
+            throw new ShopException("请输入楼层名称");
+        }
+        $Floors = new Floors();
+        $space_data['project_id'] = $project->id;
+        $space_data['name'] = $floor_name;
+        $Floors->fill($space_data);
+        $validator = $Floors->validator();
+        if ($validator->fails()) {
+            throw new ShopException($validator->messages());
+        }
+        if ($Floors->save()) {
+            //增加空间名称
+            $space_data['project_id'] = $project->id;
+            $space_data['floor_id'] = $Floors->id;
+            $space_data['name'] = "未命名空间";
+            $space = FloorSpace::create($space_data);
+            $this->updateActivateCache(\YunShop::app()->getMemberId(), $project->id);
+            return ['floor_id' => $Floors->id, 'space_id' => $space->id];
+        } else {
+            throw new ShopException("创建楼层失败");
+        }
+    }
+
+
+    //整体改价
+    public function updatePrice(int $project_id, float $ratio): array
+    {
+        try {
+            $option_ids = app('OrderManager')->make('MemberCart')->where('project_id', $project_id)->pluck("option_id")->all();
+            $updatedRows = GoodsOption::whereIn('id', $option_ids)
+                ->update(['market_price' => \DB::raw('product_price *' . $ratio)]);
+            $data = $this->updateActivateCache(\YunShop::app()->getMemberId(), $project_id);
+            $space_ids = app('OrderManager')->make('MemberCart')->where('project_id', $project_id)->pluck("space_id")->all();
+            foreach ($space_ids as $space_id) {
+                //删除缓存
+                $this->removeCacheCart($space_id);
+            }
+            return ['project_statistics' => $data];
+        } catch (\Exception $e) {
+            throw new ShopException(config("app.debug") ? $e->getMessage() : "异常失败");
+        }
+    }
+
+
+    //项目加入回收站或真删除
+    public function delete(int $id): bool
+    {
+        $is_recycle = request()->input('is_recycle');
+        try {
+            $Project = Project::withTrashed()->find($id); // 查找包含已软删除的数据
+            if ($Project->order_status == 1) {
+                throw new ShopException("已下单项目不能删除");
+            }
+            if (!$Project) {
+                throw new ShopException("找不到项目");
+            }
+            if ($Project->activate == 1) {
+                throw new ShopException("项目正在配置中不能删除");
+            }
+
+            if ($is_recycle == 1) {
+                // 真删除
+                $Project->forceDelete();
+            } else {
+                // 软删除
+                $Project->delete();
+            }
+
+            return true;
+        } catch (\Exception $e) {
+            throw new ShopException(config("app.debug") ? $e->getMessage() : "异常失败");
+        }
+    }
+
+    //更改项目状态
+    public function updateStatus(int $id, int $status): bool
+    {
+        $Project = Project::find($id);
+        if (!$Project) {
+            throw new ShopException("未找到项目");
+        }
+        try {
+            $Project->status = $status;
+            $Project->save();
+            return true;
+        } catch (\Exception $e) {
+            throw new ShopException(config("app.debug") ? $e->getMessage() : "异常失败");
+        }
+    }
+
+
+    public function getList(array $search): array
+    {
+
+
+        $member_id = \YunShop::app()->getMemberId();
+
+        $query = Project::select("id", "name", "price", "activate", "status", "report_status", "contact_name", "order_status", "order_id", "created_at", "updated_at")->where('member_id', $member_id);
+        // 按项目名称模糊搜索
+        if (!empty($search['name'])) {
+            $query->where('name', 'like', '%' . $search['name'] . '%');
+        }
+
+        //回收站
+        if ($search['is_recycle']) {
+            $query->withTrashed()->whereNotNull('deleted_at');
+        }
+
+
+        if (isset($search['order_status']) && ($search['order_status'] !== '' || $search['order_status'] === 0)) {
+            if ($search['order_status'] !== "all") {
+                $query->where('order_status', $search['order_status']);
+            }
+        }
+
+
+        $search['start_date'] = $search['start_date'] ? strtotime($search['start_date']) : "";
+
+        $search['end_date'] = $search['end_date'] ? strtotime(date('Y-m-d', strtotime($search['end_date'])) . ' 23:59:59') : null;
+        // 按创建时间范围搜索
+        if (!empty($search['start_date']) && !empty($search['end_date'])) {
+            $query->whereBetween('created_at', [$search['start_date'], $search['end_date']]);
+        } elseif (!empty($search['start_date'])) {
+            $query->where('created_at', '>=', $search['start_date']);
+        } elseif (!empty($search['end_date'])) {
+            $query->where('created_at', '<=', $search['end_date']);
+        }
+
+        // 按项目状态查询
+        if (isset($search['status']) && ($search['status'] !== '' || $search['status'] === 0)) {
+            if ($search['status'] !== "all") {
+                $query->where('order_status', $search['status']);
+            }
+        }
+        $search['order'] = $search['order'] ? $search['order'] : "id";
+        $search['sort'] = $search['sort'] == "asc" ? "asc" : "desc";
+
+        $data = $query->orderBy('activate', 'desc')->orderBy($search['order'], $search['sort'])->paginate(self::PAGE_SIZE);
+        $ids = $data->pluck('id')->toArray();
+
+        $validFloors = Floors::whereIn('project_id', $ids)
+            ->pluck('id')
+            ->toArray();
+        $validSpaces = FloorSpace::whereIn('project_id', $ids)
+            ->pluck('id')
+            ->toArray();
+        $memberCarts = DB::table('yz_member_cart as c')
+            ->join('yz_goods_option as o', 'o.id', '=', 'c.option_id')
+            ->whereIn('c.project_id', $ids)
+            ->where(function ($query) use ($validFloors, $validSpaces) {
+                // 楼层ID为0或有效的楼层ID
+                $query->whereIn('c.floor_id', $validFloors);
+            })
+            ->where(function ($query) use ($validSpaces) {
+                // 空间ID为0或有效的空间ID
+                $query->whereIn('c.space_id', $validSpaces);
+            })
+            ->whereNull('c.deleted_at') // 购物车软删除判断
+            ->selectRaw('
+        ims_c.project_id,
+        SUM(ims_o.product_price * ims_c.total) as total_price
+    ')
+            ->groupBy('c.project_id')
+            ->get()
+            ->keyBy('project_id');
+        $order_ids  = $data->pluck('order_id')->toArray();
+
+
+        $orderGoods = OrderGoods::whereIn('order_main_id', $order_ids)
+            ->selectRaw('
+          order_main_id,
+        SUM(goods_price) as total_price
+            ')
+            ->groupBy('order_main_id')
+            ->get()
+            ->keyBy('order_main_id');
+
+
+        // 给每条数据添加 cart_count 字段
+        // ✅ 为每条数据添加 status_name 字段（来自 order 关联）
+        $data->transform(function ($item) use ($memberCarts, $orderGoods) {
+            $item->no_goods = $memberCarts[$item->id] ? 1 : 0;
+            if ($item->order_status == 0) {
+                $item->price = $memberCarts[$item->id]['total_price'] ?? 0;
+            } else {
+                $item->price = $orderGoods[$item->order_id]->total_price ?? 0;
+            }
+
+            // 你还可以继续用 $addresses 做处理
+            // ✅ 从关联的 order 模型中获取 status_name
+            if ($item->order_status == 0) {
+                $item->status_name = '未下单';
+            } else {
+                $item->status_name = $item->order->status_name ?? "未下单";
+            }
+            $item->status = $item->order->new_status ?? 0;
+            return $item;
+        });
+
+        return $data->toArray();
+    }
+
+
+    public function getListV2(array $search): array
+    {
+        $member_id = \YunShop::app()->getMemberId();
+
+        // 1. 基础查询（不包含项目状态筛选，但包含其他公共条件）
+        $baseQuery = Project::select("id", "name", "price", "activate", "status", "report_status", "contact_name", "order_status", "order_id", "created_at", "updated_at")
+            ->where('member_id', $member_id)
+            ->with('order');
+
+        // 按项目名称模糊搜索
+        if (!empty($search['name'])) {
+            $baseQuery->where('name', 'like', '%' . $search['name'] . '%');
+        }
+
+        // 回收站
+        if (!empty($search['is_recycle'])) {
+            $baseQuery->withTrashed()->whereNotNull('deleted_at');
+        }
+
+        // 日期筛选
+        $start_date = !empty($search['start_date']) ? strtotime($search['start_date']) : null;
+        $end_date = !empty($search['end_date']) ? strtotime(date('Y-m-d', strtotime($search['end_date'])) . ' 23:59:59') : null;
+        if ($start_date && $end_date) {
+            $baseQuery->whereBetween('created_at', [$start_date, $end_date]);
+        } elseif ($start_date) {
+            $baseQuery->where('created_at', '>=', $start_date);
+        } elseif ($end_date) {
+            $baseQuery->where('created_at', '<=', $end_date);
+        }
+
+        // 原有的 order_status 筛选（如果不需要，可删除）
+        // if (isset($search['order_status']) && $search['order_status'] !== '' && $search['order_status'] !== 'all') {
+        //     $baseQuery->where('order_status', $search['order_status']);
+        // }
+
+        // // 原有的 status 筛选（注意与原代码中重复使用了 order_status，这里按原样保留）
+        // if (isset($search['status']) && $search['status'] !== '' && $search['status'] !== 'all') {
+        //     $baseQuery->where('order_status', $search['status']);
+        // }
+
+        // 2. 统计各状态数量（基于公共条件，不受 project_status 影响）
+        $counts = $this->getStatusCounts($baseQuery);
+
+        // 3. 应用项目状态筛选（待付款/待发货/待验收/已完成）
+        if (!empty($search['project_status']) && $search['project_status'] !== 'total') {
+            $this->applyProjectStatusFilter($baseQuery, $search['project_status']);
+        }
+
+        // 4. 排序和分页
+        $orderField = $search['order'] ?? 'id';
+        $orderSort  = ($search['sort'] ?? 'desc') === 'asc' ? 'asc' : 'desc';
+
+        $data = $baseQuery->orderBy('activate', 'desc')
+            ->orderBy($orderField, $orderSort)
+            ->paginate(self::PAGE_SIZE);
+
+        // 5. 处理购物车金额、订单金额等（原逻辑保持不变）
+        $ids = $data->pluck('id')->toArray();
+        $validFloors = Floors::whereIn('project_id', $ids)->pluck('id')->toArray();
+        $validSpaces = FloorSpace::whereIn('project_id', $ids)->pluck('id')->toArray();
+
+        $memberCarts = DB::table('yz_member_cart as c')
+            ->join('yz_goods_option as o', 'o.id', '=', 'c.option_id')
+            ->whereIn('c.project_id', $ids)
+            ->where(function ($query) use ($validFloors, $validSpaces) {
+                $query->whereIn('c.floor_id', $validFloors);
+            })
+            ->where(function ($query) use ($validSpaces) {
+                $query->whereIn('c.space_id', $validSpaces);
+            })
+            ->whereNull('c.deleted_at')
+            ->selectRaw('ims_c.project_id, SUM(ims_o.product_price * ims_c.total) as total_price')
+            ->groupBy('c.project_id')
+            ->get()
+            ->keyBy('project_id');
+
+        $order_ids = $data->pluck('order_id')->toArray();
+        $orderGoods = OrderGoods::whereIn('order_main_id', $order_ids)
+            ->selectRaw('order_main_id, SUM(goods_price) as total_price')
+            ->groupBy('order_main_id')
+            ->get()
+            ->keyBy('order_main_id');
+
+        $data->transform(function ($item) use ($memberCarts, $orderGoods) {
+            $item->no_goods = isset($memberCarts[$item->id]) ? 1 : 0;
+            if ($item->order_status == 0) {
+                $item->price = $memberCarts[$item->id]['total_price'] ?? 0;
+            } else {
+                $item->price = $orderGoods[$item->order_id]->total_price ?? 0;
+            }
+            if ($item->order_status == 0) {
+                $item->status_name = '未下单';
+            } else {
+                $item->status_name = $item->order->status_name ?? "未下单";
+            }
+            $item->status = $item->order->new_status ?? 0;
+            return $item;
+        });
+
+        // 6. 返回分页数据 + 统计数据
+        return [
+            'data'   => $data->toArray(),
+            'counts' => $counts,
+        ];
+    }
+
+
+    private function applyProjectStatusFilter($query, string $statusKey)
+    {
+        switch ($statusKey) {
+            case 'wait_pay':
+                // 待付款 = 待付预付款 + 待付尾款（不包含未下单）
+                $query->whereHas('order', function ($oq) {
+                    $oq->where(function ($q) {
+                        $q->where('status', 0)->where('orderStatus', 0)
+                            ->orWhere('status', 1)->where('orderStatus', 2);
+                    });
+                });
+                break;
+            case 'wait_delivery':
+                $query->whereHas('order', function ($oq) {
+                    $oq->where('status', 1)->where('orderStatus', 3);
+                });
+                break;
+            case 'wait_accept':
+                $query->whereHas('order', function ($oq) {
+                    $oq->where('status', 2);
+                });
+                break;
+            case 'completed':
+                $query->whereHas('order', function ($oq) {
+                    $oq->where('status', 3);
+                });
+                break;
+        }
+    }
+
+    /**
+     * 根据查询条件获取各状态的项目数量
+     * @param \Illuminate\Database\Eloquent\Builder $query 已应用公共筛选条件的基础查询
+     * @return array
+     */
+    private function getStatusCounts($query): array
+    {
+        // 克隆查询用于各状态统计（避免相互影响）
+        $total = (clone $query)->count();
+
+        // 待付款：已下单，且订单状态为“待付预付款”或“待付尾款”
+        $waitPay = (clone $query)->whereHas('order', function ($oq) {
+            $oq->where(function ($q) {
+                $q->where('status', 0)->where('orderStatus', 0)   // 待付预付款
+                    ->orWhere('status', 1)->where('orderStatus', 2); // 待付尾款
+            });
+        })->count();
+
+        // 待发货：订单状态 status=1, orderStatus=3
+        $waitDelivery = (clone $query)->whereHas('order', function ($oq) {
+            $oq->where('status', 1)->where('orderStatus', 3);
+        })->count();
+
+        // 待验收：订单状态 status=2
+        $waitAccept = (clone $query)->whereHas('order', function ($oq) {
+            $oq->where('status', 2);
+        })->count();
+
+        // 已完成：订单状态 status=3
+        $completed = (clone $query)->whereHas('order', function ($oq) {
+            $oq->where('status', 3);
+        })->count();
+
+        return [
+            'total'        => $total,
+            'wait_pay'     => $waitPay,
+            'wait_delivery' => $waitDelivery,
+            'wait_accept'  => $waitAccept,
+            'completed'    => $completed,
+        ];
+    }
+
+
+    private function generateUniqueProjectName($name)
+    {
+        // 检查是否已经是 "_副本" 或 "_副本X" 结尾
+        if (preg_match('/_副本(\d+)?$/', $name, $matches)) {
+            $baseName = $name; // 如果已有“副本”，直接使用原来的
+        } else {
+            $baseName = $name . '_副本'; // 如果没有，则添加 _副本
+        }
+
+        $newName = $baseName;
+        $count = 1;
+
+        while (Project::where('name', $newName)->exists()) {
+            $newName = $baseName . $count;
+            $count++;
+        }
+
+        return $newName;
+    }
+
+
+    //创建项目副本
+    public function copyProject(int $id): bool
+    {
+        $originalProject = Project::with(['floors.spaces.spaceCart'])->find($id);
+        if (!$originalProject) {
+            throw new ShopException("项目不存在");
+        }
+
+        return $this->transaction(function () use ($originalProject) {
+            // 创建新项目
+            $newProjectData = $originalProject->toArray();
+            unset($newProjectData['id'], $newProjectData['created_at'], $newProjectData['updated_at'], $newProjectData['deleted_at']); // 去掉原 ID，避免冲突
+            $newProjectData['name'] = $this->generateUniqueProjectName($newProjectData['name']); // 给项目名称添加副本标识
+            $newProjectData['report_status'] = 0;
+            $newProjectData['factory_status'] = 0;
+            $newProjectData['bid_status'] = 0;
+            $newProjectData['activate'] = 0;
+            $newProjectData['order_id'] = 0;
+            $newProjectData['price'] = 0;
+            $newProjectData['order_status'] = 0;
+            $newProject = $this->save($newProjectData); // 创建新项目
+
+            // 复制楼层及其空间和商品
+            foreach ($originalProject->floors as $originalFloor) {
+                $newFloorData = $originalFloor->toArray();
+                unset($newFloorData['id'], $newFloorData['project_id']); // 去掉原 ID
+                $newFloorData['project_id'] = $newProject->id;
+
+                $newFloor = Floors::create($newFloorData); // 创建新楼层
+
+                // 复制空间
+                foreach ($originalFloor->spaces as $originalSpace) {
+                    $newSpaceData = $originalSpace->toArray();
+                    unset($newSpaceData['id'], $newSpaceData['floor_id'], $newSpaceData['project_id']);
+                    $newSpaceData['project_id'] = $newProject->id;
+                    $newSpaceData['floor_id'] = $newFloor->id;
+
+                    $newSpace = FloorSpace::create($newSpaceData); // 创建新空间
+
+                    // 复制商品
+                    foreach ($originalSpace->spaceCart as $originalGood) {
+                        $newGoodsData = $originalGood->toArray();
+                        unset($newGoodsData['id'], $newGoodsData['space_id'], $newGoodsData['floor_id'], $newGoodsData['project_id']);
+                        $newGoodsData['project_id'] = $newProject->id;
+                        $newGoodsData['floor_id'] = $newFloor->id;
+                        $newGoodsData['space_id'] = $newSpace->id;
+
+                        $this->addGoodsSpace($newGoodsData);
+                    }
+                }
+            }
+
+            return true; // 返回新项目 ID
+        });
+    }
+
+
+    public function detail(int $id): array
+    {
+        $projectDetail = Project::select("id", "province_id", "activate", "city_id", "district_id", "name", "price", "report_status", "bid_status", "factory_status", "order_status", "order_id", "status", "address_detail", "contact_name", "phone", "created_at")->with(['floors' => function ($query) {
+            $query->select("id", "name", "project_id");
+        }, 'order' => function ($query) {
+            $query->select("id", "status", "first_pay_time", "orderStatus", "order_type");
+        }])->find($id);
+        if (!$projectDetail) {
+            throw new AppException("未找到项目");
+        }
+
+        $projectDetail->created_at_text = self::formatCreatedAt($projectDetail->created_at);
+
+        if ($projectDetail->order->new_status == 3) {
+            $max_lead_time = 0;
+            $orderMainGoods = OrderGoods::where('order_main_id', $projectDetail->order_id)->get();
+            if ($orderMainGoods->isNotEmpty()) {
+                $max_lead_time = $orderMainGoods->max(function ($goods) {
+                    return isset($goods->goods->lead_time) ? (int)$goods->goods->lead_time : 0;
+                });
+            }
+
+            if ($projectDetail->order->first_pay_time && $max_lead_time > 0) {
+                // 计算预计完成日期
+                $expected_finish_date = $projectDetail->order->first_pay_time->copy()->addDays($max_lead_time);
+                // 当前时间
+                $now = \Carbon\Carbon::now();
+                // 计算剩余天数
+                $remaining_days = $now->diffInDays($expected_finish_date, false); // false 表示允许负值
+
+                // 添加到 item 中方便返回
+                $projectDetail->order->expected_finish_date = $expected_finish_date->format('Y-m-d H:i:s');
+                $projectDetail->order->remaining_days_text = $remaining_days;
+            } else {
+                $projectDetail->order->expected_finish_date = "";
+                $projectDetail->order->remaining_days_text = "";
+            }
+        }
+
+        $projectDetail->status_data = $this->getProjectStatusText($projectDetail);
+        //获取项目投标状态
+
+        //获取省市
+        $province = Address::whereIn('id', [$projectDetail->province_id, $projectDetail->city_id, $projectDetail->district_id])->pluck("areaname")->toArray();
+        $projectDetail->project_address_detail = $province[0] . $province[1] . $province[2] . $projectDetail->address_detail;
+        //获取项目商品数据
+        //        $cartList = app('CartContainer')->make('MemberCart')->carts()
+        //            ->where(app('CartContainer')->make('MemberCart')->getTable() . '.project_id', $projectDetail->id)
+        //            ->orderBy(app('CartContainer')->make('MemberCart')->getTable() . '.created_at', 'desc')
+        //            ->get();
+
+        //        $goods_data = $this->handleGoods($cartList);
+        //        $projectDetail->goods_data = $goods_data;
+        //平面图
+        $plan_data = Floors::select("id", "name", "is_cad", "goods_total", "thumb")->where('project_id', $projectDetail->id)->with(['spaces' => function ($query) {
+            $query->select("id", "floor_id", "name");
+        }])->orderBy('sort', 'asc')->get()->toArray();
+
+        foreach ($plan_data as $key => $item) {
+            $plan_data[$key]['thumb'] = yz_tomedia($item['thumb']);
+        }
+
+        $projectDetail->plan_data = $plan_data;
+        //报备信息
+        $projectDetail->reportDetail = $this->getReportDetail($projectDetail);
+        //ppt方案
+        $pptList = ProjectPdf::select("id", "project_name", "template_id", "total_slides", "ppt_formal_url", "thumb_url", "ppt_url", "created_at")->where('project_id', $projectDetail->id)->where('status', 1)->with(['template' => function ($query) {
+            $query->select("id", "thumb");
+        }])->get();
+
+        $pptList->transform(function ($item) {
+            $url = "";
+            if ($item->ppt_formal_url) {
+                $url = yz_tomedia($item->ppt_formal_url);
+            } elseif ($item->thumb_url) {
+                $url = $item->thumb_url;
+            } elseif ($item->ppt_url) {
+                $url = $item->ppt_url;
+            }
+            $item->ppt_formal_url = $url;
+            $item->template->thumb = yz_tomedia($item->template->thumb);
+            $item->created_days_ago = $item->created_at->diffInDays(Carbon::now());
+            return $item;
+        });
+        $pptTemplate = PptTemplate::select("id", "name", "thumb", "url")->where('status', 1)->get();
+        $pptTemplate->transform(function ($item) {
+            $item->thumb = yz_tomedia($item->thumb);
+            return $item;
+        });
+        $projectDetail->ppt = [
+            'pptList' => $pptList->toArray(),
+            'pptTemplate' => $pptTemplate->toArray()
+        ];
+
+        //投标信息
+        $projectDetail->bid = $this->getBidDetail($projectDetail);
+        //工厂考察信息
+        $factory = $this->getFactory($projectDetail);
+        $projectDetail->factory_inspection = $factory;
+
+        //助手上门获取项目上门订单
+        $projectDetail->door_orders = $this->getDoorOrdersByProjectId($projectDetail->id);
+
+        return $projectDetail->toArray();
+    }
+
+
+    // 格式化方法
+    private static function formatCreatedAt($createdAt)
+    {
+        if (!$createdAt) {
+            return '';
+        }
+
+        $now = now();
+
+        $diffInHours = $createdAt->diffInHours($now);
+        $diffInDays = $createdAt->diffInDays($now);
+
+        if ($diffInHours < 1) {
+            // 小于1小时，显示具体分钟？需求中没有明确，按1小时前处理
+            return '1小时前';
+        } elseif ($diffInDays < 3) {
+            // 3天内，显示多少小时前
+            return $diffInHours . '小时前';
+        } else {
+            // 超过3天，显示完整日期
+            return $createdAt->format('Y/m/d');
+        }
+    }
+
+
+    /**
+     * 根据项目ID获取所有上门订单（格式化后用于项目详情）
+     *
+     * @param int $projectId
+     * @return array
+     */
+    public function getDoorOrdersByProjectId(int $projectId): array
+    {
+        // 查询该项目下的所有上门订单（存在 projectDoor 关联）
+
+        $orders = app('OrderManager')->make('Order')->where('project_id', $projectId)->where('order_type', 5)
+            ->with([
+                'project' => function ($query) {
+                    $query->select('id', 'name');
+                },
+                'projectDoor',
+                'supplier'
+            ])
+            ->orderBy('created_at', 'desc')    // 最新订单在前
+            ->get();
+
+
+        $result = [];
+
+        foreach ($orders as $order) {
+            $door = $order->projectDoor;
+            if (!$door) {
+                continue;
+            }
+
+            // ---- 地址拼接 ----
+            $address = Address::whereIn('id', [$door->province_id, $door->city_id, $door->district_id, $order->supplier->province_id, $order->supplier->city_id, $order->supplier->district_id])
+                ->pluck('areaname')
+                ->toArray();
+            $fullAddress = ($address[0] ?? '') . ($address[1] ?? '') . ($address[2] ?? '') . $door->address_detail;
+
+            // ---- 服务商信息 ----
+            $supplierService = SupplierService::withTrashed()
+                ->where('id', $door->service_id)
+                ->with(['service'])
+                ->first();
+
+            // ---- 服务费用明细（多选）----
+            $serviceFeeIds = explode(',', $door->service_type ?? '');
+            $serviceFees = SupplierServiceFee::withTrashed()
+                ->whereIn('id', $serviceFeeIds)
+                ->with(['service'])
+                ->get();
+
+
+            $serviceFeeList = [];
+
+            foreach ($serviceFees as $fee) {
+                $serviceFeeList[] = $fee->service->name ?? '';
+            }
+            $goodsPriceTotal = $order->goods_price;
+
+
+            // ---- 品牌订单折扣（同项目下是否存在 order_type=3 的品牌订单）----
+            $brandOrder = Order::where('project_id', $order->project_id)
+                ->where('order_type', 3)
+                ->whereIn('status', [1, 2, 3])
+                ->first();
+            $discountPrice = $brandOrder ? $goodsPriceTotal : 0;
+            $extraAmount = ($door->extra_enable == 1) ? ($door->extra_amount ?? 0) : 0;
+            $totalPrice = $goodsPriceTotal - $discountPrice + $extraAmount;
+
+
+
+            // ---- 组装单个订单返回结构 ----
+            $result[] = [
+                'order_id'          => $order->id,
+                'order_sn'          => $order->order_sn ?? '',
+                'status'            => $order->new_status,
+                'status_name'       => $order->status_name,
+                'submit_time'          => $order->create_time ? $order->create_time->toDateTimeString() : '',
+            
+                'confirm_time'      => $order->confirm_time ? date('Y-m-d H:i:s', $order->confirm_time) : '', //接单时间
+                'accept_time'     => $order->pay_time ? date('Y-m-d H:i:s', $order->pay_time) : '', //验收时间
+                'submit_date'          => $order->create_time ? $order->create_time->toDateString() : '', //日期类型
+                'goods_price'       => $goodsPriceTotal,     // 原总价
+                'discount_price'    => $discountPrice,
+                'extra_amount'      => $extraAmount,
+                'total_price'       => $totalPrice,          // 实付金额
+                'service_type'      => implode("、", $serviceFeeList),
+                'refund_id'         => $order->refund_id,
+                'is_pending'        => $order->is_pending,
+
+                // 服务品牌（对应 UI 左侧品牌卡片）
+                'brand' => [
+                    'logo'          => yz_tomedia($order->supplier->logo ?? ''),
+                    'name'          => $order->supplier->store_name,
+                    'description'   => $order->supplier->introduction ?? '',
+                    'contact_name'  => $order->supplier->realname ?? '',
+                    'contact_phone' => $order->supplier->mobile ?? '',
+                    'service_link'  => ServiceUser::getDistributeService(0),
+                    'email'         => '',
+                    'company_address' => ($address[3] ?? '') . ($address[4] ?? '') . ($address[5] ?? '') . $order->supplier->address
+                ],
+
+
+                // 订单详情（地址、上门时间、面积等）
+                'detail' => [
+                    'order_sn' => $order->order_sn ?? '',
+                    'service_name'      => $supplierService->service->name, //商品类目
+                    'door_time'     => $door->door_time ?? '',
+                    'project_area'  => $door->project_area,
+                    'address'       => $fullAddress, //项目地址
+                    'submit_time'   => $order->create_time ? $order->create_time->toDateTimeString() : '',
+                    'remark'        => $door->remark ?? '',
+                    'project_name'  => $door->project->name,
+                    'service_type'      => implode("、", $serviceFeeList), //服务类型
+                    'service_day'      => $door->service_day ?? '',
+                    'number'          => $door->number, //协助人数
+                    'contact_name'    => $door->contact_name,
+                    'contact_phone'     => $door->contact_phone,
+                    'files'             => [
+                        'name' => '资料文件',
+                        'url'  => $order->information ? yz_tomedia($order->information) : '',
+                    ],
+                    'total_price' => $totalPrice,
+                     //现场图片
+                     "scene_img"=> unserialize($door->scene_img),
+                     //施工图纸
+                     "build_img"=> unserialize($door->build_img),
+                     //技术联系人
+                     "technical_contact" => $order->technical_contact,
+                     "technical_phone" => $order->technical_phone,
+
+                ],
+            ];
+        }
+
+        return $result;
+    }
+
+
+
+    protected  function getProjectStatusText($project)
+    {
+        if ($project->report_status == 0) {
+            return ['last_status' => 1, 'name' => '未申请报备'];
+        } elseif ($project->report_status == 1) {
+            return ['last_status' => 2, 'name' => '报备申请中'];
+        } elseif ($project->report_status == 3) {
+            return ['last_status' => 3, 'name' => '报备申请未通过'];
+        } elseif ($project->report_status == 4) {
+            return ['last_status' => 4, 'name' => '报备结束'];
+        } elseif ($project->report_status == 2) {
+            switch ($project->bid_status) {
+                case 1:
+                    return ['last_status' => 5, 'name' => '已报备成功'];
+                case 2:
+
+                    return ['last_status' => 6, 'name' => '投标申请中'];
+                case 3:
+                    return ['last_status' => 7, 'name' => '投标申请未通过'];
+                case 4:
+                    return ['last_status' => 8, 'name' => '投标中'];
+                case 5:
+                    return ['last_status' => 9, 'name' => '投标结束'];
+            }
+        }
+    }
+
+
+    protected function getFactory($projectDetail)
+    {
+        $factory = ProjectFactoryInspection::where('project_id', $projectDetail->id)->first();
+        if (!$factory) {
+            return [];
+        }
+        $date1 = Carbon::parse($factory->scheduled_inspection_date);
+        $date2 = Carbon::parse($factory->scheduled_arrival_date);
+
+
+        //获取品牌信息
+        $supplier = Supplier::select("id", "store_name", "logo", "province_id", "city_id", "introduction", "address", "district_id", "street_id")->where('id', $factory->supplier_id)->first();
+        $addresses = Address::whereIn('id', [$supplier->province_id, $supplier->city_id, $supplier->district_id, $supplier->street_id])->pluck('areaname')->toArray();
+        $supplier->province_name = $addresses[0] ? mb_substr($addresses[0], 0, -1, "UTF-8") : "";;
+        $supplier->city_name = $addresses[1] ? mb_substr($addresses[1], 0, -1, "UTF-8") : "";;
+        $supplier->logo = yz_tomedia($supplier->logo);
+        $supplier->mobile = "17777777777";
+        $supplier->addressDetail = $addresses[0] . $addresses[1] . $addresses[2] . $addresses[3] . $supplier->address;
+        $selected_ids = explode(",", $factory->projects_visit);
+        $selected_names = array_column(
+            array_filter(self::projects_visit, fn($item) => in_array($item['id'], $selected_ids)),
+            'name'
+        );
+        $company_type_data = ProjectProgress::whereIn('id', explode(",", $factory->company_type))->pluck('name')->toArray();
+        $deltail = [
+            "id" => $factory->id,
+            "project_name" => $factory->name,
+            'project_address_detail' => $projectDetail->address_detail,
+            'inspection_mode' => $factory->inspection_mode == 1 ? "带客考察" : "自行参观",
+            "scheduled_inspection_date" => $date1->format('Y年m月d日'),
+            "scheduled_arrival_date" => $date2->format('Y年m月d日 H:i'),
+            "applicant_name" => $factory->applicant_name,
+            "applicant_phone" => $factory->applicant_phone,
+            "company_name" => $factory->company_name,
+            "contact_name" => $factory->contact_name,
+            'contact_phone' => $factory->contact_phone,
+            "company_type" => implode(",", $company_type_data),
+            'apply_time' => $factory->created_at->format('Y-m-d H:i:s'),
+            'approved_time' => $factory->approved_time,
+            "supplier" => $supplier->toArray(),
+            "need_top_leader" => $factory->need_top_leader == 1 ? "是" : "否",
+            "play_video" => $factory->play_video == 1 ? "是" : "否",
+            "is_led" => $factory->is_led == 1 ? "是" : "否",
+            "welcome_word" => $factory->welcome_word,
+            "projects_visit" => implode(",", $selected_names),
+            "travel_mode" => $factory->travel_mode == 1 ? "自驾前往" : "需派车接送",
+            "need_hotel_booking" => $factory->need_hotel_booking == 1 ? "是" : "否",
+            "need_restaurant_booking" => $factory->need_restaurant_booking == 1 ? "是" : "否",
+            "travel_mode_val" => $factory->travel_mode,
+            "need_hotel_booking_val" => $factory->need_hotel_booking,
+            "need_restaurant_booking_val" => $factory->need_restaurant_booking,
+            "need_top_leader_val" => $factory->need_top_leader,
+            "play_video_val" => $factory->play_video,
+            "is_led_val" => $factory->is_led
+
+
+        ];
+
+        if ($factory->travel_mode == 1) {
+            $deltail['license_plate'] = $factory->license_plate;
+        } else {
+            $deltail['wait_place'] = $factory->wait_place;
+            $deltail['wait_time'] = $factory->wait_time;
+        }
+
+        if ($factory->need_hotel_booking == 1) {
+            $method = collect(self::payment_method)->firstWhere('id', $factory->payment_method);
+            $payment_method_name = $method['name'];
+            $date3 = Carbon::parse($factory->check_in_start_date);
+            $date4 = Carbon::parse($factory->check_in_start_date);
+            $wan = $date3->diffInDays($date4);
+            $deltail['hot_info'] = $payment_method_name . "，" . $date3->format('Y年m月d日') . "至" . $date4->format('Y年m月d日') . "，" . "共" . $wan . "晚";
+            $deltail['room_info'] = "标间" . $factory->room_count_standard . "间，" . "单间" . $factory->room_count_single . "间";
+        }
+        if ($factory->need_restaurant_booking == 1) {
+            $meal_start_date = Carbon::parse($factory->meal_start_date);
+            $meal_type = $factory->meal_type == 1 ? "午餐" : "晚餐";
+            $deltail['restaurant'] = $meal_start_date->format('Y年m月d日') . "，" . $meal_type . "，" . $factory->people_number . "人，" . "价位" . $factory->price_range . "/人";
+        }
+        return $deltail;
+    }
+
+
+    protected function getBidDetail($projectDetail)
+    {
+        $ProjectBid = ProjectBid::where('project_id', $projectDetail->id)->first();
+        if (!$ProjectBid) {
+            return [];
+        }
+
+        //项目地址
+
+        $province = Address::whereIn('id', [$ProjectBid->province_id, $ProjectBid->city_id, $ProjectBid->district_id])->pluck("areaname")->toArray();
+        $address_detail = $province[0] . $province[1] . $province[2] . $ProjectBid->address_detail;
+        //投标模式
+
+
+        $company_type = ProjectProgress::whereIn('id', explode(",", $ProjectBid->company_type))->pluck("name")->toArray();
+
+        //获取报备品牌信息
+        $supplier = Supplier::select("id", "store_name", "logo", "province_id", "city_id", "introduction")->where('id', $ProjectBid->supplier_id)->first();
+        $addresses = Address::whereIn('id', [$supplier->province_id, $supplier->city_id])->pluck('areaname')->toArray();
+        $supplier->province_name = $addresses[0] ? mb_substr($addresses[0], 0, -1, "UTF-8") : "";;
+        $supplier->city_name = $addresses[1] ? mb_substr($addresses[1], 0, -1, "UTF-8") : "";;
+        $supplier->logo = yz_tomedia($supplier->logo);
+        $supplier->report_time = $ProjectBid->approved_time ? date("Y/m/d", $ProjectBid->approved_time) : "";
+        $SupplierCharge = SupplierCharge::where('supplier_id', $ProjectBid->supplier_id)->first();
+        //相关费用
+
+        $project_fee = 0;
+        $pay_status = 0;
+        if ($ProjectBid->bid_type == 1) {
+            $amount_paid = Order::where('bid_id', $ProjectBid->id)->whereIn('order_type', [2, 3, 4])->whereIn('status', [1, 2, 3])->sum('price') ?: 0;
+            $unpaid_amount = Order::where('bid_id', $ProjectBid->id)->whereIn('order_type', [2, 3, 4])->where('status', 0)->sum('price') ?: 0;
+            $project_fee = Order::where('bid_id', $ProjectBid->id)->where('order_type', 4)->sum('price') ?: 0;
+            if ($ProjectBid->bid_type == 1 && $ProjectBid->need_bid_bond == 1) {
+                if ($ProjectBid->bid_order_status == 1 && $ProjectBid->brand_order_status == 1 && $ProjectBid->project_order_status == 1) {
+                    $pay_status = 1;
+                }
+            }
+            if ($ProjectBid->bid_type == 1 && $ProjectBid->need_bid_bond == 0) {
+                if ($ProjectBid->bid_order_status == 1 && $ProjectBid->brand_order_status == 1) {
+                    $pay_status = 1;
+                }
+            }
+        } else {
+            $amount_paid = Order::where('bid_id', $ProjectBid->id)->whereIn('order_type', [2, 3])->whereIn('status', [1, 2, 3])->sum('price') ?: 0;
+            $unpaid_amount = Order::where('bid_id', $ProjectBid->id)->whereIn('order_type', [2, 3])->where('status', 0)->sum('price') ?: 0;
+            if ($ProjectBid->bid_type == 2 && $ProjectBid->need_bid_document == 1) {
+                if ($ProjectBid->bid_order_status == 1 && $ProjectBid->brand_order_status == 1) {
+                    $pay_status = 1;
+                }
+            }
+
+            if ($ProjectBid->bid_type == 2 && $ProjectBid->need_bid_document == 0) {
+                if ($ProjectBid->brand_order_status == 1) {
+                    $pay_status = 1;
+                }
+            }
+        }
+
+        $report_day = 15;
+        $start_date = $ProjectBid->created_at->format('Y/m/d');
+        $end_date = $ProjectBid->created_at->addDays($report_day)->format('Y/m/d');
+        //获取对应的投标订单id
+        $orders = Order::where('bid_id', $ProjectBid->id)
+            ->whereIn('order_type', [2, 3, 4])
+            ->where('status', '!=', -1)
+            ->get()
+            ->keyBy('order_type');
+
+        $bid_doc_order_id = $orders[2]->id ?? null;
+        $brand_order_id   = $orders[3]->id ?? null;
+        $deposit_order_id = $orders[4]->id ?? null;
+        $relatedCosts = [
+            'amount_paid' => $amount_paid,
+            'bid_fee' => $SupplierCharge->bid_document_fee ?: 0,
+            'bid_fee_status' => $ProjectBid->bid_order_status, //0 未支付  1 已支付
+            'brand_fee' => $SupplierCharge->brand_fee ?: 0,
+            'brand_fee_status' => $ProjectBid->brand_order_status, //0 未支付  1 已支付
+            'project_fee' => $project_fee,
+            'project_fee_status' => $ProjectBid->project_order_status,
+            'unpaid_amount' => $unpaid_amount, //待付款金额
+            'bid_doc_order_id' => $bid_doc_order_id,
+            'brand_order_id' => $brand_order_id,
+            'deposit_order_id' => $deposit_order_id
+        ];
+        //获取厂家默认投标版本
+        $SupplierBidFiles = SupplierBidFiles::where('supplier_id', $ProjectBid->supplier_id)->first();
+
+        $addresse_map = Address::whereIn('id', [$ProjectBid->consignee_province_id, $ProjectBid->consignee_city_id, $ProjectBid->consignee_district_id])->pluck("areaname")->toArray();
+        //标书收货地址
+        $consignee_info = [
+            'consignee' => $ProjectBid->consignee,
+            'consignee_mobile' => $ProjectBid->consignee_mobile,
+            'consignee_address_detail' => implode(" ", [
+                $addresse_map[0],
+                $addresse_map[1],
+                $addresse_map[2],
+                $ProjectBid->consignee_address_detail
+
+            ])
+        ];
+
+        $balance_payment_info = [
+            'account_name' => $ProjectBid->account_name,
+            'bank_branch' => $ProjectBid->bank_branch,
+            'bank_name' => $ProjectBid->bank_name,
+            'contact_bank_mobile' => $ProjectBid->contact_bank_mobile
+        ];
+
+        $detail = [
+            "id" => $ProjectBid->id,
+            'project_name' => $ProjectBid->name,
+            'project_address_detail' => $address_detail,
+            'project_area' => $ProjectBid->project_area,
+            'company_name' => $ProjectBid->company_name,
+            'company_address' => $ProjectBid->company_address,
+            'contact_name' => $ProjectBid->contact_name . "/" . $ProjectBid->contact_phone,
+            'company_type_name' => implode(",", $company_type),
+            'apply_time' => $ProjectBid->created_at->format('Y-m-d H:i:s'),
+            'approved_time' => $ProjectBid->approved_time ? date("Y-m-d H:i:s", $ProjectBid->approved_time) : "",
+            'bid_type_name' => $ProjectBid->bid_type == 1 ? "工厂直投" : "授权投标",
+            'bid_type' => $ProjectBid->bid_type,
+            'related_costs' => $relatedCosts,
+            "supplier" => $supplier,
+            'pay_status' => $pay_status,
+            "report_period_start" => $start_date,
+            "report_period_end" => $end_date,
+            'need_bid_bond' => $ProjectBid->need_bid_bond,
+            'need_bid_document' => $ProjectBid->need_bid_document,
+            "bid_files" => $ProjectBid->bid_files ? unserialize($ProjectBid->bid_files) : [],
+            'default_bid_files' => $SupplierBidFiles ? unserialize($SupplierBidFiles->file_path) : [],
+            'reject_reason' => $ProjectBid->reject_reason,
+            'consignee_info' => $consignee_info,
+            'balance_payment_info' => $balance_payment_info
+        ];
+
+
+
+        if ($ProjectBid->bid_type == 1) {
+            $detail['authorized_person_name'] = $ProjectBid->authorized_person_name;
+            $detail['authorized_person_phone'] = $ProjectBid->authorized_person_phone;
+            $detail['authorized_person_idcard'] = yz_tomedia($ProjectBid->authorized_person_idcard);
+        }
+
+        if ($ProjectBid->need_bid_bond == 1) {
+            $detail['account_name'] = $ProjectBid->account_name;
+            $detail['bank_branch'] = $ProjectBid->bank_branch;
+            $detail['bank_name'] = $ProjectBid->bank_name;
+            $detail['contact_phone'] = $ProjectBid->contact_phone;
+        }
+
+        return $detail;
+    }
+
+    protected function getReportDetail($projectDetail)
+    {
+        $ProjectReport = ProjectReport::where('project_id', $projectDetail->id)->first();
+        if (!$ProjectReport) {
+            return [];
+        }
+
+        //项目地址
+
+        $province = Address::whereIn('id', [$ProjectReport->province_id, $ProjectReport->city_id, $ProjectReport->district_id])->pluck("areaname")->toArray();
+        $address_detail = $province[0] . $province[1] . $province[2] . $ProjectReport->address_detail;
+        //采购模式
+
+        $purchasing = PurchasingModes::whereIn('id', explode(",", $ProjectReport->purchase_mode))->pluck("name")->toArray();
+        if (count($purchasing) >= 2) {
+            $purchase_mode = $purchasing[0] . " - " . $purchasing[1];
+        } else {
+            $purchase_mode = $purchasing[0];
+        }
+        //项目进度
+        $project_progress = ProjectProgress::whereIn('id', explode(",", $ProjectReport->project_progress))->pluck("name")->toArray();
+
+        $company_type = ProjectProgress::whereIn('id', explode(",", $ProjectReport->company_type))->pluck("name")->toArray();
+        //获取报备品牌信息
+        $supplier = Supplier::select("id", "store_name", "logo", "province_id", "city_id", "introduction", "is_bid")->where('id', $ProjectReport->supplier_id)->first();
+        $addresses = Address::whereIn('id', [$supplier->province_id, $supplier->city_id])->pluck('areaname')->toArray();
+        $supplier->province_name = $addresses[0] ? mb_substr($addresses[0], 0, -1, "UTF-8") : "";
+        $supplier->city_name = $addresses[1] ? mb_substr($addresses[1], 0, -1, "UTF-8") : "";;
+        $supplier->logo = yz_tomedia($supplier->logo);
+        $supplier->report_time = $ProjectReport->approved_time ? date("Y/m/d", $ProjectReport->approved_time) : "";
+
+        $report_day = 60;
+        $start_date = "";
+        $end_date = "";
+        if ($ProjectReport->approved_time) {
+            // 如果不是 Carbon 实例，则转为 Carbon 实例
+            if (!($ProjectReport->approved_time instanceof Carbon)) {
+                $approved_time = Carbon::parse($ProjectReport->approved_time);
+            } else {
+                $approved_time = $ProjectReport->approved_time->copy(); // 避免修改原值
+            }
+
+            $start_date = $approved_time->format('Y/m/d');
+            $end_date = $approved_time->copy()->addDays($report_day)->format('Y/m/d');
+        }
+        $service_link = ServiceUser::getDistributeService($supplier->id);
+        return [
+            "id" => $ProjectReport->id,
+            "budget" => $ProjectReport->budget,
+            'project_name' => $ProjectReport->name,
+            'project_address_detail' => $address_detail,
+            'project_area' => $ProjectReport->project_area,
+            'purchase_mode' => $purchase_mode,
+            'need_bid_document' => $ProjectReport->need_bid_document == 1 ? "需要" : "不需要",
+            'need_factory_inspection' => $ProjectReport->need_factory_inspection == 1 ? "需要" : "不需要",
+            'project_progress' => implode(",", $project_progress),
+            'company_name' => $ProjectReport->company_name,
+            'company_address' => $ProjectReport->company_address,
+            'contact_name' => $ProjectReport->contact_name . "/" . $ProjectReport->contact_phone,
+            'company_type' => implode(",", $company_type),
+            'apply_time' => $ProjectReport->created_at->format('Y-m-d H:i:s'),
+            "approved_date" => $ProjectReport->approved_time ? $ProjectReport->approved_time->format('Y/m/d') : $ProjectReport->created_at->format('Y/m/d'),
+            'approved_time' => $ProjectReport->approved_time ? $ProjectReport->approved_time->format('Y-m-d H:i:s') : "",
+            'supplier' => $supplier->toArray(),
+            "report_period_start" => $start_date,
+            "report_period_end" => $end_date,
+            "reject_reason" => $ProjectReport->reject_reason,
+            "is_bid" => $supplier->is_bid,
+            'service_link' => $service_link
+
+
+        ];
+    }
+
+
+    public function planDelete(int $id): bool
+    {
+
+        try {
+            $PlanImg = PlanImg::find($id);
+            if (!$PlanImg) {
+                throw new AppException("平面数据不存在");
+            }
+            $PlanImg->delete();
+            return true;
+        } catch (\Exception $e) {
+            throw new AppException(config("app.debug") ? $e->getMessage() : "异常失败");
+        }
+    }
+
+
+    public function restore(int $id): bool
+    {
+        try {
+            $project = Project::withTrashed()->find($id);
+            if (!$project) {
+                throw new AppException("未找到项目");
+            }
+            $project->restore();
+            return true;
+        } catch (\Exception $e) {
+            throw new AppException(config("app.debug") ? $e->getMessage() : "异常失败");
+        }
+    }
+
+
+    protected function handleGoods($cartList)
+    {
+        if ($cartList) {
+            $cartList = $cartList->toArray();
+            $total_price = 0;
+            $total_num = 0;
+            $newList = [];
+            foreach ($cartList as $key => $item) {
+                $newList[$key]['id'] = $item['id'];
+                $newList[$key]['goods_id'] = $item['goods_id'];
+                $newList[$key]['thumb'] = yz_tomedia($item['goods_option']['thumb']);
+                $total_num += $item['total'];
+                $total_price += $item['total'] * $item['goods_option']['market_price'];
+            }
+
+            return ['goods' => $newList, 'total_num' => $total_num, 'total_price' => $this->truncate_to_two_decimals($total_price)];
+        }
+
+        return [];
+    }
+
+
+
+
+
+
+
+    /*private function updateActivateCache($member_id,$project_id)
+    {
+        $project = Project::getProject($project_id);
+        if($project->activate != 1){
+            return;
+        }
+        Redis::del("user:{$member_id}:active_project");
+        $activate_project = Project::select("id","name","activate","status")->where("member_id",$member_id)->where("id",$project_id)->where('activate',1)
+            ->with(["floors"=>function($query){
+                $query->select("id","project_id","name","activate")->with([
+                    'spaces'=>function($query){
+                        $query->select("id","floor_id","name","activate")->withSum('spaceCart', 'total');
+                    }
+                ]);
+            }])->first()->toArray();
+        foreach ($activate_project['floors'] as $key=>$item){
+            foreach ($item['spaces'] as $k=> $space){
+                $goodsIds = MemberCart::where('space_id',$space['id'])->pluck('goods_id')->all();
+
+                $total_price = Goods::whereIn('id',$goodsIds)->sum("price")?:0;
+                $activate_project['floors'][$key]['spaces'][$k]['total_price'] =$total_price*$space['space_cart_sum_total'];
+            }
+        }
+        Redis::set("user:{$member_id}:active_project", json_encode($activate_project));
+        return $activate_project;
+    }*/
+
+
+    /**
+     * 处理楼层的增删改
+     * @param Project $projectModel
+     * @param array $floorData
+     * @return Floors
+     */
+    private function updateOrCreateFloor(Project $projectModel, array $floorData, int $key): Floors
+    {
+        $floor = Floors::find($floorData['id']);
+
+        if ($floor) {
+            // 更新楼层
+            $floor->name = $floorData['name'];
+            $floor->sort = $key;
+            $floor->save();
+        } else {
+            // 新增楼层
+            if (empty($floorData['name'])) {
+                throw new ShopException("请填入楼层名称");
+            }
+
+            $floor = Floors::create([
+                'project_id' => $projectModel->id,
+                'name' => $floorData['name'],
+                "sort" => $key
+            ]);
+        }
+
+        return $floor;
+    }
+
+
+    public function realDelete(int $id): bool
+    {
+        try {
+            $project = Project::withTrashed()->find($id);
+            if (!$project) {
+                throw new AppException("未找到项目");
+            }
+            // 真实删除（永久删除数据）
+            $project->forceDelete();
+            return true;
+        } catch (\Exception $e) {
+            throw new AppException(config("app.debug") ? $e->getMessage() : "异常失败");
+        }
+    }
+
+    /**
+     * 处理楼层下空间的增删改
+     * @param Floors $floor
+     * @param array $spacesData
+     * @return array
+     */
+    private function updateOrCreateSpaces(Floors $floor, array $spacesData): array
+    {
+        $spacesIds = [];
+        //获取楼层所有空间
+        $space_all = FloorSpace::where('floor_id', $floor->id)->pluck("id")->all();
+        foreach ($spacesData as $k => $spaceData) {
+
+            $space = FloorSpace::find($spaceData['id']);
+
+            if ($space) {
+                //不在这个楼层说明是移动过来的空间
+                if (!in_array($spaceData['id'], $space_all)) {
+                    $space->floor_id = $floor->id;
+                }
+                // 更新空间
+                $space->name = $spaceData['name'];
+                $space->sort = $k;
+                $space->save();
+            } else {
+                // 新增空间
+                if (empty($spaceData['name'])) {
+                    throw new ShopException("请填入空间名称");
+                }
+
+                $spaceDataNew = [
+                    'project_id' => $floor->project_id,
+                    'floor_id' => $floor->id,
+                    'name' => $spaceData['name'],
+                    'sort' => $k,
+                ];
+                $space = FloorSpace::create($spaceDataNew);
+            }
+
+            $spacesIds[] = $space->id;
+        }
+
+        return $spacesIds;
+    }
+
+    /**
+     * 删除不在请求中的楼层
+     * @param Project $projectModel
+     * @param array $floorsIds
+     */
+    private function deleteUnusedFloors(Project $projectModel, array $floorsIds)
+    {
+        Floors::where('project_id', $projectModel->id)
+            ->whereNotIn('id', $floorsIds)
+            ->get()
+            ->each(function ($floor) {
+                $floor->spaces()->delete(); // 删除该楼层下的所有空间
+                $floor->delete(); // 删除楼层
+            });
+    }
+
+
+
+    /*protected function addGoodsSpaceBatch(array $list)
+    {
+        $insertList = [];
+
+        foreach ($list as $data) {
+            $data['components'] = [
+                [
+                    "color_id" => 3,
+                    "component_id" => 4
+                ]
+            ];
+            $data['components'] = json_encode($data['components'], JSON_UNESCAPED_UNICODE);
+            $new_data = array(
+                'member_id' => \YunShop::app()->getMemberId(),
+                'uniacid' => \YunShop::app()->uniacid,
+                'project_id' => $data['project_id'],  //项目id
+                'space_id' => $data['space_id'],  //空间id
+                'floor_id' => $data['floor_id'],  //楼层id
+                'goods_id' => $data['goods_id'],
+                'total' => $data['total'],
+                'option_id' => $data['option_id'] ?: 0,
+                'components' => $data['components'],
+                'components_hash' => md5($data['components'])
+            );
+
+            $insertList[] = $new_data;
+        }
+
+        MemberCart::insert($insertList);
+    }*/
+
+
+
+    protected function addGoodsSpaceBatch(array $list)
+    {
+
+
+        if (empty($list)) {
+            return;
+        }
+
+        // 获取所有option_id
+        $optionIds = array_column($list, 'option_id');
+        $optionIds = array_filter(array_unique($optionIds)); // 去重并过滤空值
+
+        // 一次性查询所有GoodsOptionModel数据
+        $options = GoodsOptionModel::whereIn('option_id', $optionIds)
+            ->select(['id', 'default_color', 'option_id'])
+            ->get()
+            ->groupBy('option_id') // 按id分组，处理一个option_id对应多条记录的情况
+            ->toArray();
+
+        $insertList = [];
+
+        foreach ($list as $data) {
+
+            $optionId = $data['option_id'] ?: 0;
+            $components = [];
+
+            if ($optionId && isset($options[$optionId])) {
+                // 遍历该option_id对应的所有记录
+                foreach ($options[$optionId] as $option) {
+                    // 反序列化default_color
+                    $defaultColor = unserialize($option['default_color']);
+
+                    // 如果反序列化失败，设置为空数组
+                    if ($defaultColor === false) {
+                        $defaultColor = [];
+                    }
+
+                    // 添加到components数组
+                    $components[] = [
+                        "color_id" => $defaultColor['id'] ?? 3,
+                        "component_id" => $option['id'] ?: 4,
+                    ];
+                }
+            }
+
+            // 如果没有找到任何option记录，添加默认组件
+            if (empty($components)) {
+                $components[] = [
+                    "color_id" => 3,
+                    "component_id" => 4,
+                ];
+            }
+            $data['components'] = $components;
+            $data['components'] = json_encode($data['components'], JSON_UNESCAPED_UNICODE);
+            $goods_info = Goods::where('id', $data['goods_id'])->first();
+            if ($goods_info->type2 == 2) {
+                $member_cart_info = MemberCart::withTrashed()->where('goods_id', $data['goods_id'])->where('member_id', \YunShop::app()->getMemberId())->first();
+                if ($member_cart_info) {
+                    $data['components'] = $member_cart_info->components;
+                    $data['jsonData'] = $member_cart_info->jsonData;
+                    $data['modelData'] = $member_cart_info->modelData;
+                }
+            }
+            $new_data = array(
+                'member_id' => \YunShop::app()->getMemberId(),
+                'uniacid' => \YunShop::app()->uniacid,
+                'project_id' => $data['project_id'],  //项目id
+                'space_id' => $data['space_id'],  //空间id
+                'floor_id' => $data['floor_id'],  //楼层id
+                'goods_id' => $data['goods_id'],
+                'type' => $goods_info->type2,
+                'total' => $data['total'],
+                'option_id' => $data['option_id'] ?: 0,
+                'components' => $data['components'],
+                'components_hash' => md5($data['components']),
+                'jsonData' => $data['jsonData'] ?: null,
+                'modelData' => $data['modelData'] ?: null,
+            );
+
+            $insertList[] = $new_data;
+        }
+
+        MemberCart::insert($insertList);
+    }
+
+
+    //处理数据
+    private function handleData($d)
+    {
+        $data = unserialize($d);
+
+
+        // 获取所有 color_id
+        $allColorIds = [];
+        foreach ($data as $item) {
+            foreach ($item['components'] as $component) {
+                $allColorIds[] = $component['color_id'];
+            }
+        }
+        $allColorIds = array_unique($allColorIds);
+
+        // 获取颜色数据映射 (假设这是您的查询结果)
+        $colorDataMap = SupplierColorPlane::select("id", "name", "thumb")
+            ->whereIn('id', $allColorIds)
+            ->get()
+            ->keyBy('id')
+            ->toArray();
+
+        // 定义 option_id 到名称的映射 (根据您的业务逻辑调整)
+
+
+        // 统计每个 option_id 的数量和组件信息
+        $statistics = [];
+
+        foreach ($data as $item) {
+            $optionId = $item['option_id'];
+            $num = $item['num'];
+            $optionName = "未知类型";
+
+            // 准备组件统计
+            $componentsInfo = [];
+
+            foreach ($item['components'] as $component) {
+                $componentName = $component['component_name'];
+                $colorId = $component['color_id'];
+
+                // 获取颜色信息
+                $colorInfo = $colorDataMap[$colorId] ?? ['name' => "未知颜色({$colorId})", 'thumb' => ''];
+                $colorName = $colorInfo['name'];
+
+                // 构建组件描述
+                $componentDesc = "{$componentName}「{$colorName}」";
+                $componentsInfo[] = $componentDesc;
+            }
+
+            // 合并相同 option 的统计
+            if (!isset($statistics[$optionId])) {
+                $statistics[$optionId] = [
+                    'name' => $optionName,
+                    'total_num' => 0,
+                    'components_list' => []
+                ];
+            }
+
+            $statistics[$optionId]['total_num'] += $num;
+
+            // 如果是第一次遇到这个 option，保存组件列表
+            if (empty($statistics[$optionId]['components_list'])) {
+                $statistics[$optionId]['components_list'] = $componentsInfo;
+            }
+        }
+
+        // 生成最终格式字符串
+        $resultStrings = [];
+
+        foreach ($statistics as $optionId => $stat) {
+            $optionName = $stat['name'];
+            $totalNum = $stat['total_num'];
+            $components = $stat['components_list'];
+
+            // 构建组件描述字符串
+            $componentsStr = implode('，', array_map(function ($comp) {
+                return "【{$comp}X1】";
+            }, $components));
+
+            $resultStrings[] = "{$optionName}X{$totalNum}：{$componentsStr}";
+        }
+
+        $finalResult = implode('；', $resultStrings);
+        return $finalResult;
+    }
+
+
+
+
+    //一键生成项目
+
+    protected function addGoodsSpace(array $data)
+    {
+        $data['components'] = $data['components'] ?: json_encode([
+            [
+                "color_id" => 3,
+                "component_id" => 4
+            ]
+        ]);
+        $data['components'] = $data['components'];
+        $data = array(
+            'member_id' => \YunShop::app()->getMemberId(),
+            'uniacid' => \YunShop::app()->uniacid,
+            'project_id' => $data['project_id'],  //项目id
+            'space_id' => $data['space_id'],  //空间id
+            'floor_id' => $data['floor_id'],  //楼层id
+            'goods_id' => $data['goods_id'],
+            'type' => $data['type'] ?: 1,
+            'total' => $data['total'],
+            'option_id' => $data['option_id'] ?: 0,
+            'components' => $data['components'],
+            'components_hash' => md5($data['components'])
+        );
+        //验证项目楼层空间
+
+
+        $cartModel = app('OrderManager')->make('MemberCart', $data);
+        $hasGoodsModel = app('OrderManager')->make('MemberCart')->hasGoodsToMemberCart($data);
+        $cart_id = $hasGoodsModel['id'];
+        //todo 商品权限最低购买数量处理
+        $min_buy_limit = 0;
+
+
+        if ($hasGoodsModel) {
+            $num = intval($data['total']) ?: 1;
+            $hasGoodsModel->total = max($hasGoodsModel->total + $num, $min_buy_limit);
+
+            $hasGoodsModel->validate();
+
+            if ($hasGoodsModel->update()) {
+
+                return ['code' => 200];
+            }
+            throw new ShopException('数据更新失败，请重试！');
+        }
+        $cartModel->validate();
+
+        $validator = $cartModel->validator($cartModel->getAttributes());
+        if ($validator->fails()) {
+            throw new ShopException("数据验证失败，加入空间失败！！！");
+        } else {
+            if ($cartModel->save()) {
+
+                return ['code' => 200];
+            } else {
+                throw new ShopException("写入出错，加入空间失败！！！");
+            }
+        }
+        throw new ShopException("接收数据出错，加入空间失败!");
+    }
+
+
+    public function savePlan(): bool
+    {
+        $data = request()->input('plan');
+        $project = Project::find($data['project_id']);
+        if (!$project) {
+            throw new ShopException('项目不存在');
+        }
+        try {
+            if ($data['floors']) {
+                $floorIds = collect($data['floors'])->pluck('floor_id'); // 提取 floor_id
+
+                // 判断是否有重复值
+                if ($floorIds->count() !== $floorIds->unique()->count()) {
+                    throw new AppException("不能选择有重复的楼层");
+                }
+                foreach ($data['floors'] as $item) {
+                    if (!$item['floor_id']) {
+                        throw new AppException("请选择楼层");
+                    }
+                    $planImgModel = PlanImg::where('floor_id', $item['floor_id'])->where('project_id', $project->id)->first();
+                    if ($planImgModel) {
+                        $planImgModel->thumb = $item['output_img'];
+                        $planImgModel->dxf_url = $item['dxf_file'];
+                        $planImgModel->goods_total = $item['goods_total'];
+                        $planImgModel->original_file = $item['original_file'];
+                        $planImgModel->save();
+                    } else {
+                        $createData = [
+                            'project_id' => $project->id,
+                            'floor_id' => $item['floor_id'],
+                            'thumb' => $item['output_img'],
+                            'dxf_url' => $item['dxf_file'],
+                            'original_file' => $item['original_file'],
+                            'goods_total' => $item['goods_total']
+                        ];
+                        PlanImg::create($createData);
+                    }
+                }
+                return true;
+            } else {
+                throw new AppException("请上传cad数据");
+            }
+        } catch (\Exception $e) {
+            throw new AppException(config("app.debug") ? $e->getMessage() : "异常失败");
+        }
+    }
+
+    public function getProjectData(int $space_id): array
+    {
+
+        $data = [];
+        $data['activate_project'] = $this->getActiveProject();
+
+        $data['goods_list'] = $this->getProductGoodsV2($space_id);
+        $data['lovely_goods_list'] = $this->lovely();
+        return $data;
+    }
+
+    private function getProductGoodsV2($space_id)
+    {
+        $member_id = \YunShop::app()->getMemberId();
+        $cacheKey = "member_cart_list_{$member_id}_{$space_id}";
+        $data = Cache::get($cacheKey);
+        if ($data) {
+            return $data;
+        }
+
+        $data = $this->processProduct($member_id, $space_id);
+        Cache::put($cacheKey, $data, 24 * 60 + rand(10, 99));
+        return $data;
+    }
+
+    private function lovely()
+    {
+        $lovely_list = \app\frontend\modules\goods\models\Goods::select("id", "title", "thumb")->with(['hasManyOptions' => function ($query) {
+            $query->select("id", "goods_id", "product_price");
+        }])->limit(20)->get();
+
+        $lovely_list = $lovely_list->map(function ($item) {
+            $productPrices = $item->hasManyOptions->pluck('product_price')->filter()->all();
+
+            $min_price = !empty($productPrices) ? min($productPrices) : $item->price;
+            $max_price = !empty($productPrices) ? max($productPrices) : $item->price;
+            return [
+                'id' => $item->id,
+                'title' => $item->title,
+                'min_price' => $min_price,
+                'max_price' => $max_price,
+                'thumb' => yz_tomedia($item->thumb),
+            ];
+        })->all();
+        return $lovely_list;
+    }
+}
